@@ -1,0 +1,5 @@
+pyulog>=1.2
+pvlib>=0.15
+pandas>=2.0
+numpy
+matplotlib
