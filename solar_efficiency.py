@@ -24,8 +24,12 @@ Cell reference data (Maxeon Gen 7 datasheet, 546209 Rev C):
   - Cell area       : ~155 cm^2 per cell
   - Cell efficiency : ~25.4% (Pe/Oe bin boundary -> "typical" cell)
   - Power temp coeff: -0.27 %/degC, relative to STC_TEMP_C (25 degC). Applied
-    as an optional derating on the theoretical power when --apply-temp-derate
-    is passed (off by default -- see "Temperature derating" below).
+    as an optional adjustment on the theoretical power when --apply-temp-derate
+    is passed (off by default -- see "Temperature derating" below). Despite
+    the name, this is NOT always a loss: since the coefficient is negative,
+    Tout above 25 degC reduces theoretical power (a loss) but Tout BELOW
+    25 degC increases it (a gain). The code, plot, and summary all handle
+    both signs -- don't assume derating only ever shrinks power.
 
 Theoretical/available array power at each instant is:
 
@@ -320,8 +324,14 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
     merged = merged.join(irr)
 
     # Optional temperature derating: factor = 1 + coeff%/degC * (Tout - STC_TEMP_C).
-    # Input temp is clamped defensively (e.g. against a future dead-sentinel
-    # reading) before computing the factor -- see TOUT_CLAMP_RANGE_C.
+    # coeff is negative, so Tout ABOVE STC_TEMP_C (25 degC) is a LOSS
+    # (factor < 1) but Tout BELOW STC_TEMP_C is a GAIN (factor > 1) -- this
+    # is not just a loss term, and downstream code/plots must not assume it
+    # always reduces power. Input temp is clamped defensively (e.g. against
+    # a future dead-sentinel reading) before computing the factor -- see
+    # TOUT_CLAMP_RANGE_C -- and the resulting factor itself is floored at 0
+    # (power can shrink toward zero in a pathological case, but never go
+    # negative) as a final backstop.
     if args.apply_temp_derate:
         tout_clamped = merged["tout_c"].clip(*TOUT_CLAMP_RANGE_C)
         n_clamped = (merged["tout_c"] != tout_clamped).sum()
@@ -331,7 +341,7 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
         merged["temp_derate_factor"] = (
             1.0 + (POWER_TEMP_COEFF_PCT_PER_C / 100.0) * (tout_clamped - STC_TEMP_C)
         )
-        merged["temp_derate_factor"] = merged["temp_derate_factor"].fillna(1.0)
+        merged["temp_derate_factor"] = merged["temp_derate_factor"].fillna(1.0).clip(lower=0.0)
     else:
         merged["temp_derate_factor"] = 1.0
 
@@ -392,8 +402,11 @@ def print_summary(df: pd.DataFrame, args: argparse.Namespace, tz: str) -> None:
         print(f"Fuselage skin temp (Tout proxy): mean {df['tout_c'].mean():.1f} degC  "
               f"range [{df['tout_c'].min():.1f}, {df['tout_c'].max():.1f}] degC")
         if args.apply_temp_derate:
-            derate_pct = 100.0 * (1.0 - df["temp_derate_factor"].mean())
-            print(f"Temp derate applied      : mean {derate_pct:.1f}%  "
+            # Positive change_pct = LOSS (Tout above STC), negative = GAIN
+            # (Tout below STC) -- coeff is negative, so don't assume a loss.
+            change_pct = 100.0 * (1.0 - df["temp_derate_factor"].mean())
+            direction = "loss" if change_pct >= 0 else "gain"
+            print(f"Temp derate effect       : mean {abs(change_pct):.1f}% {direction}  "
                   f"(STC {STC_TEMP_C:.0f} degC, coeff {POWER_TEMP_COEFF_PCT_PER_C}%/degC)")
     print(f"Energy delivered (meas.) : {energy_actual_wh:.1f} Wh")
     print(f"Energy available (model.): {energy_theoretical_wh:.1f} Wh")
@@ -449,8 +462,21 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
                 alpha=0.6, label="Theoretical, No Temp Derate")
         ax.plot(df.index, df["pv_power_theoretical_w"], color="tab:olive", linestyle="-.",
                 label="Theoretical, Temp-Derated")
-        ax.fill_between(df.index, df["pv_power_theoretical_w"], df["pv_power_theoretical_nominal_w"],
-                         color="tab:red", alpha=0.15, label="Temp Derate Loss")
+        # Tout above STC (25 degC) is a LOSS (derated < nominal); Tout below
+        # STC is a GAIN (derated > nominal) since the coefficient is
+        # negative -- shade/label each region distinctly rather than
+        # assuming it's always a loss. Only label a region if it actually
+        # occurs, so the legend doesn't show an entry with no matching area.
+        derated = df["pv_power_theoretical_w"]
+        nominal = df["pv_power_theoretical_nominal_w"]
+        is_loss = derated < nominal
+        is_gain = derated > nominal
+        ax.fill_between(df.index, derated, nominal, where=is_loss, interpolate=True,
+                         color="tab:red", alpha=0.15,
+                         label="Temp Derate Loss" if is_loss.any() else None)
+        ax.fill_between(df.index, derated, nominal, where=is_gain, interpolate=True,
+                         color="tab:cyan", alpha=0.15,
+                         label="Temp Derate Gain" if is_gain.any() else None)
     else:
         ax.plot(df.index, df["pv_power_theoretical_w"], color="tab:green", linestyle="--",
                 label="Theoretical (GHI x Area x Cell Eff.)")
