@@ -35,9 +35,15 @@ Theoretical/available array power at each instant is:
 
     P_theoretical(t) = GHI_clearsky(t) [W/m^2] * total_cell_area [m^2] * cell_efficiency [* temp_derate_factor(t)]
 
-GHI_clearsky is modeled with pvlib's Ineichen clear-sky model, driven by the
-*aircraft's* lat/lon/altitude/time at each sample -- not a fixed ground
-station -- so it tracks the flight's actual position and altitude gain.
+GHI_clearsky is modeled with a Beer-Lambert atmospheric attenuation model,
+driven by the *aircraft's* lat/lon/altitude/time at each sample -- not a
+fixed ground station -- so it tracks the flight's actual position and
+altitude gain. See SEA_LEVEL_TRANSMITTANCE below for why this replaced
+pvlib's Ineichen/Perez clear-sky model: Ineichen's altitude correction is an
+unbounded linear term fit from ground weather stations, and it produced GHI
+above the physical top-of-atmosphere ceiling once extrapolated to this
+aircraft's stratospheric cruise altitude (~55-58 kft on the flight this was
+first caught on) -- see git history for the full derivation.
 
 IMPORTANT SIMPLIFICATION -- clear sky, not actual sky: GHI_clearsky is a
 zero-cloud idealization; it has no mechanism to represent real cloud cover.
@@ -101,6 +107,20 @@ DEFAULT_CELL_EFFICIENCY = 0.254      # 25.4%, typical Pe/Oe bin boundary
 POWER_TEMP_COEFF_PCT_PER_C = -0.27   # informational, not applied by default
 STC_TEMP_C = 25.0
 STC_IRRADIANCE_W_M2 = 1000.0
+
+# Beer-Lambert sea-level zenith transmittance: broadband atmospheric
+# transmittance looking straight up through the WHOLE atmosphere, at sea
+# level, sun directly overhead. Value and model both borrowed from
+# Icarus-Matrix/vehicle-simulation's endurance calculator (apollo.yaml,
+# rebuild-endurance-calculator branch @ 2026-08-25), which validates this
+# exact form against a reference irradiance workbook. Chosen over pvlib's
+# Ineichen/Perez clear-sky model specifically because this form is bounded
+# by construction: attenuation is transmittance^pressure_ratio(altitude), and
+# pressure_ratio only ever approaches 0 as altitude increases, so
+# transmittance only ever approaches 1 (no attenuation) -- GHI can get
+# arbitrarily close to but can never exceed toa_irradiance * cos(zenith) at
+# any altitude. Ineichen's altitude term has no equivalent ceiling.
+SEA_LEVEL_TRANSMITTANCE = 0.70
 
 GPS_TOPIC = "vehicle_gps_position"
 MPPT_TOPICS = ("/zeus/mppt_0", "/zeus/mppt_1")
@@ -217,35 +237,68 @@ def load_temperature(ulog: ULog) -> pd.DataFrame | None:
 # --------------------------------------------------------------------------
 # Solar geometry / clear-sky irradiance
 # --------------------------------------------------------------------------
+def isa_pressure_ratio(alt_m: np.ndarray) -> np.ndarray:
+    """ISA static pressure as a fraction of sea level, piecewise to 32 km.
+
+    p/p0 = (rho/rho0) * (T/T0) via the ideal gas law. Vectorized port of
+    Icarus-Matrix/vehicle-simulation's air_density()/air_temperature_K()
+    (endurance.py); 32 km covers any altitude this aircraft flies (this
+    flight peaked at ~17.6 km).
+    """
+    alt_m = np.asarray(alt_m, dtype=float)
+    density = np.where(
+        alt_m <= 11000.0,
+        1.225 * ((288.15 - 0.0065 * alt_m) / 288.15) ** 4.25587,
+        np.where(
+            alt_m <= 20000.0,
+            0.363918 * np.exp(-0.000157688 * (alt_m - 11000.0)),
+            0.088035 * ((216.65 + 0.001 * (alt_m - 20000.0)) / 216.65) ** -35.1632,
+        ),
+    )
+    temperature_k = np.where(
+        alt_m <= 11000.0,
+        288.15 - 0.0065 * alt_m,
+        np.where(alt_m <= 20000.0, 216.65, 216.65 + 0.001 * (alt_m - 20000.0)),
+    )
+    return (density / 1.225) * (temperature_k / 288.15)
+
+
 def compute_clearsky_irradiance(times: pd.DatetimeIndex, lat: np.ndarray,
                                  lon: np.ndarray, alt_m: np.ndarray) -> pd.DataFrame:
-    """Per-sample clear-sky GHI using the aircraft's own position/time (Ineichen model)."""
+    """Per-sample clear-sky GHI using the aircraft's own position/time/altitude
+    (Beer-Lambert attenuation -- see SEA_LEVEL_TRANSMITTANCE for why, not
+    pvlib's Ineichen/Perez model).
+
+    dni_w_m2/dhi_w_m2 are a simplified all-beam/no-diffuse split for the CSV
+    export only -- this model doesn't compute diffuse sky radiation
+    separately (it was a ~1% contribution even under the old Ineichen model
+    at this flight's altitudes). ghi_w_m2 is the only one of the three that
+    feeds the theoretical-power calc, summary, and plot.
+    """
     solpos = pvlib.solarposition.get_solarposition(times, lat, lon, altitude=alt_m)
+    cos_zenith = np.cos(np.radians(solpos["apparent_zenith"].values))
+    sun_up = cos_zenith > 0.0
 
-    pressure = pvlib.atmosphere.alt2pres(alt_m)
-    airmass_rel = pvlib.atmosphere.get_relative_airmass(solpos["apparent_zenith"])
-    airmass_abs = pvlib.atmosphere.get_absolute_airmass(airmass_rel, pressure)
+    dni_extra = np.asarray(pvlib.irradiance.get_extra_radiation(times), dtype=float)
+    tau = SEA_LEVEL_TRANSMITTANCE ** isa_pressure_ratio(alt_m)
 
-    # Linke turbidity lookup needs a single site; the flight track spans only
-    # a few km, so the mean lat/lon is a fine stand-in for the whole flight.
-    linke_turbidity = pvlib.clearsky.lookup_linke_turbidity(times, float(np.mean(lat)), float(np.mean(lon)))
-    dni_extra = pvlib.irradiance.get_extra_radiation(times)
+    # Plane-parallel airmass (1/cos z). Only meaningful where the sun is up;
+    # elsewhere cos_zenith<=0 would blow this up for no reason since ghi/dni
+    # are forced to 0 below regardless.
+    safe_cos_zenith = np.where(sun_up, cos_zenith, 1.0)
+    direct_normal_w_m2 = dni_extra * tau ** (1.0 / safe_cos_zenith)
 
-    clearsky = pvlib.clearsky.ineichen(
-        solpos["apparent_zenith"], airmass_abs, linke_turbidity,
-        altitude=alt_m, dni_extra=dni_extra,
-    )
-
-    ghi = clearsky["ghi"].clip(lower=0.0)
-    ghi[solpos["apparent_elevation"].values <= 0] = 0.0
+    ghi = np.where(sun_up, direct_normal_w_m2 * cos_zenith, 0.0)
+    dni = np.where(sun_up, direct_normal_w_m2, 0.0)
+    dhi = np.zeros_like(ghi)  # not modeled -- see docstring above
 
     out = pd.DataFrame(
         {
             "sun_elevation_deg": solpos["apparent_elevation"].values,
             "sun_azimuth_deg": solpos["azimuth"].values,
-            "ghi_w_m2": ghi.values,
-            "dni_w_m2": clearsky["dni"].values,
-            "dhi_w_m2": clearsky["dhi"].values,
+            "ghi_w_m2": ghi,
+            "dni_w_m2": dni,
+            "dhi_w_m2": dhi,
         },
         index=times,
     )
@@ -338,7 +391,7 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
                   f"measured power - likely disconnected/unused for this flight.")
 
     # Clear-sky irradiance at the aircraft's own position/time.
-    print("Computing solar position + clear-sky irradiance (pvlib, Ineichen model) ...")
+    print("Computing solar position (pvlib) + clear-sky irradiance (Beer-Lambert) ...")
     irr = compute_clearsky_irradiance(
         merged.index, merged["lat"].values, merged["lon"].values, merged["alt_msl_m"].values
     )
