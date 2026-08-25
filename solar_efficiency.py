@@ -27,27 +27,27 @@ Cell reference data (Maxeon Gen 7 datasheet, 546209 Rev C):
   - Cell area       : ~155 cm^2 per cell
   - Cell efficiency : ~25.4% (Pe/Oe bin boundary -> "typical" cell)
   - Power temp coeff: -0.27 %/degC, relative to STC_TEMP_C (25 degC). Applied
-    as an optional adjustment on the theoretical power when --apply-temp-derate
+    as an optional adjustment on the estimated power when --apply-temp-derate
     is passed (off by default -- see "Temperature derating" below). Despite
     the name, this is NOT always a loss: since the coefficient is negative,
-    Tout above 25 degC reduces theoretical power (a loss) but Tout BELOW
+    Tout above 25 degC reduces estimated power (a loss) but Tout BELOW
     25 degC increases it (a gain). The code, plot, and summary all handle
     both signs -- don't assume derating only ever shrinks power.
 
-Theoretical/available array power at each instant is layered in three tiers,
+Estimated/available array power at each instant is layered in three tiers,
 each one a further loss on top of the last (see "Panel incidence angle",
 "Encapsulation transmission", and "Temperature derating" below for each term):
 
     P_bare(t)        = POA_irradiance(t) [W/m^2] * total_cell_area [m^2] * cell_efficiency
     P_no_temp_derate(t) = P_bare(t) * etfe_transmission * poe_transmission
-    P_theoretical(t) = P_no_temp_derate(t) [* temp_derate_factor(t)]
+    P_estimated(t) = P_no_temp_derate(t) [* temp_derate_factor(t)]
 
 P_bare is the cell nameplate ceiling with nothing between the sun and the
 cells -- not physically real for this array, but a useful "no losses at
 all" reference. P_no_temp_derate adds the encapsulation stack's light loss
 (ETFE cover + POE encapsulant, both always applied, not opt-in) and is what
 "efficiency" is actually measured against when --apply-temp-derate is off.
-P_theoretical is the final number used everywhere once temp derating is
+P_estimated is the final number used everywhere once temp derating is
 added on top.
 
 POA_irradiance (plane-of-array) is the clear-sky direct beam projected onto
@@ -435,7 +435,7 @@ def compute_clearsky_irradiance(times: pd.DatetimeIndex, lat: np.ndarray,
     altitudes). ghi_w_m2 assumes a flat HORIZONTAL surface (irradiance on
     a plate facing straight up); it's kept as a reference curve, but
     poa_w_m2 (derived from dni_w_m2 via panel_normal_ned(), see below) is
-    what actually drives the theoretical-power calc unless
+    what actually drives the estimated-power calc unless
     --assume-horizontal is passed.
     """
     solpos = pvlib.solarposition.get_solarposition(times, lat, lon, altitude=alt_m)
@@ -517,7 +517,7 @@ def cos_incidence_angle(roll_deg: np.ndarray, pitch_deg: np.ndarray, yaw_deg: np
 
     Where attitude is NaN (no /zeus/flight match for that sample), falls
     back to cos(zenith) -- i.e. the flat-horizontal assumption -- rather
-    than propagating NaN into the theoretical-power calc for that row.
+    than propagating NaN into the estimated-power calc for that row.
     """
     normal = panel_normal_ned(roll_deg, pitch_deg, yaw_deg, normal_body)
     sun = sun_direction_ned(elevation_deg, azimuth_deg)
@@ -644,7 +644,7 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
     # PANEL_NORMAL_BODY_STRING_0/_1), so project the direct beam onto the
     # actual, rotating panel normal instead of assuming it always faces
     # straight up. ghi_w_m2 (flat-plate) is kept as-is for comparison;
-    # poa_w_m2 is what actually drives pv_power_theoretical_bare_w below,
+    # poa_w_m2 is what actually drives pv_power_estimated_bare_w below,
     # unless --assume-horizontal was passed (in which case poa_w_m2 ==
     # ghi_w_m2). poa_w_m2 uses string 1's normal specifically -- it's the
     # array-wide POA the rest of the pipeline (efficiency, main plot) has
@@ -687,7 +687,7 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
     else:
         merged["temp_derate_factor"] = 1.0
 
-    # Theoretical array output, three tiers (see module docstring for the
+    # Estimated array output, three tiers (see module docstring for the
     # full breakdown): bare-cell ceiling -> encapsulation loss (ETFE cover x
     # POE encapsulant, both always applied, stacked -- see "Encapsulation
     # transmission") -> optional temp derate. Bare is kept around
@@ -695,22 +695,22 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
     # only kept as its own column when temp derating is on, so the plot can
     # show all three and make the derate's effect visible on top of the
     # (already-applied) encapsulation loss -- when derating is off, nominal
-    # IS the final theoretical number.
+    # IS the final estimated number.
     total_area_m2 = args.cell_count * args.cell_area_cm2 / 1e4
     bare_w = merged["poa_w_m2"] * total_area_m2 * args.cell_efficiency
-    merged["pv_power_theoretical_bare_w"] = bare_w
+    merged["pv_power_estimated_bare_w"] = bare_w
     encapsulation_transmission = args.etfe_transmission * args.poe_transmission
     nominal_w = bare_w * encapsulation_transmission
     if args.apply_temp_derate:
-        merged["pv_power_theoretical_nominal_w"] = nominal_w
-        merged["pv_power_theoretical_w"] = nominal_w * merged["temp_derate_factor"]
+        merged["pv_power_estimated_nominal_w"] = nominal_w
+        merged["pv_power_estimated_w"] = nominal_w * merged["temp_derate_factor"]
     else:
-        merged["pv_power_theoretical_w"] = nominal_w
+        merged["pv_power_estimated_w"] = nominal_w
 
-    valid = (merged["sun_elevation_deg"] > 0) & (merged["pv_power_theoretical_w"] > 1.0)
+    valid = (merged["sun_elevation_deg"] > 0) & (merged["pv_power_estimated_w"] > 1.0)
     merged["pre_mppt_efficiency_pct"] = np.nan
     merged.loc[valid, "pre_mppt_efficiency_pct"] = (
-        100.0 * merged.loc[valid, "pv_power_actual_w"] / merged.loc[valid, "pv_power_theoretical_w"]
+        100.0 * merged.loc[valid, "pv_power_actual_w"] / merged.loc[valid, "pv_power_estimated_w"]
     )
 
     merged.attrs["total_area_m2"] = total_area_m2
@@ -725,7 +725,7 @@ def print_summary(df: pd.DataFrame, args: argparse.Namespace, tz: str) -> None:
     dt_hours = df.index.to_series().diff().dt.total_seconds().fillna(0.0) / 3600.0
     dt_hours = dt_hours.clip(upper=10.0 / 3600.0)  # ignore >10s gaps in energy integration
     energy_actual_wh = (df["pv_power_actual_w"].clip(lower=0) * dt_hours).sum()
-    energy_theoretical_wh = (df["pv_power_theoretical_w"].fillna(0) * dt_hours).sum()
+    energy_estimated_wh = (df["pv_power_estimated_w"].fillna(0) * dt_hours).sum()
 
     rated_stc_w = args.cell_count * args.cell_area_cm2 / 1e4 * args.cell_efficiency * STC_IRRADIANCE_W_M2
 
@@ -773,13 +773,13 @@ def print_summary(df: pd.DataFrame, args: argparse.Namespace, tz: str) -> None:
             print(f"Temp derate effect       : mean {abs(change_pct):.1f}% {direction}  "
                   f"(STC {STC_TEMP_C:.0f} degC, coeff {POWER_TEMP_COEFF_PCT_PER_C}%/degC)")
     print(f"Energy delivered (meas.) : {energy_actual_wh:.1f} Wh")
-    print(f"Energy available (model.): {energy_theoretical_wh:.1f} Wh")
+    print(f"Energy available (model.): {energy_estimated_wh:.1f} Wh")
     if len(daylight):
         eff = daylight["pre_mppt_efficiency_pct"]
         print(f"Pre-MPPT efficiency      : mean {eff.mean():.1f}%  median {eff.median():.1f}%  "
               f"p10-p90 [{eff.quantile(0.1):.1f}%, {eff.quantile(0.9):.1f}%]")
-    if energy_theoretical_wh > 0:
-        print(f"Energy-weighted efficiency: {100 * energy_actual_wh / energy_theoretical_wh:.1f}%")
+    if energy_estimated_wh > 0:
+        print(f"Energy-weighted efficiency: {100 * energy_actual_wh / energy_estimated_wh:.1f}%")
     print("=" * 70)
     print("NOTE: efficiency is measured against modeled CLEAR-SKY GHI, which has")
     print("no mechanism to represent real cloud cover -- any actual clouds during")
@@ -834,29 +834,29 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     ax.set_title("Modeled Clear-Sky Irradiance Along the Flight Track", fontweight="bold")
     legend_outside(ax, ax2)
 
-    has_derate = "pv_power_theoretical_nominal_w" in df.columns
+    has_derate = "pv_power_estimated_nominal_w" in df.columns
 
     ax = axes[2]
     ax.plot(df.index, df["pv_power_actual_w"], color="tab:blue", label="Measured Pre-MPPT Power")
     # Bare-cell ceiling (no ETFE, no POE, no temp derate) is always drawn as
     # a thin reference line -- not physically real for this array, but it's
     # the only way to see the encapsulation stack's loss on the plot when
-    # temp derating is off (in that case "nominal"/"theoretical" below are
+    # temp derating is off (in that case "nominal"/"estimated" below are
     # the same curve).
-    ax.plot(df.index, df["pv_power_theoretical_bare_w"], color="tab:gray", linestyle=":",
-            alpha=0.6, label="Theoretical, No Temp Derate, Bare Cells")
+    ax.plot(df.index, df["pv_power_estimated_bare_w"], color="tab:gray", linestyle=":",
+            alpha=0.6, label="Estimated, No Temp Derate, Bare Cells")
     if has_derate:
-        ax.plot(df.index, df["pv_power_theoretical_nominal_w"], color="tab:green", linestyle="--",
-                alpha=0.6, label="Theoretical, No Temp Derate, Encapsulated")
-        ax.plot(df.index, df["pv_power_theoretical_w"], color="tab:olive", linestyle="-.",
-                label="Theoretical, Temp-Derated, Encapsulated")
+        ax.plot(df.index, df["pv_power_estimated_nominal_w"], color="tab:green", linestyle="--",
+                alpha=0.6, label="Estimated, No Temp Derate, Encapsulated")
+        ax.plot(df.index, df["pv_power_estimated_w"], color="tab:olive", linestyle="-.",
+                label="Estimated, Temp-Derated, Encapsulated")
         # Tout above STC (25 degC) is a LOSS (derated < nominal); Tout below
         # STC is a GAIN (derated > nominal) since the coefficient is
         # negative -- shade/label each region distinctly rather than
         # assuming it's always a loss. Only label a region if it actually
         # occurs, so the legend doesn't show an entry with no matching area.
-        derated = df["pv_power_theoretical_w"]
-        nominal = df["pv_power_theoretical_nominal_w"]
+        derated = df["pv_power_estimated_w"]
+        nominal = df["pv_power_estimated_nominal_w"]
         is_loss = derated < nominal
         is_gain = derated > nominal
         ax.fill_between(df.index, derated, nominal, where=is_loss, interpolate=True,
@@ -866,13 +866,13 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
                          color="tab:cyan", alpha=0.15,
                          label="Temp Derate Gain" if is_gain.any() else None)
     else:
-        # pv_power_theoretical_w already has the ETFE loss baked in (see
+        # pv_power_estimated_w already has the ETFE loss baked in (see
         # analyze()), so it IS the "No Temp Derate, Encapsulated" tier here --
         # there's no separate nominal column to plot on top of the bare-cell line.
-        ax.plot(df.index, df["pv_power_theoretical_w"], color="tab:green", linestyle="--",
-                label="Theoretical, No Temp Derate, Encapsulated")
+        ax.plot(df.index, df["pv_power_estimated_w"], color="tab:green", linestyle="--",
+                label="Estimated, No Temp Derate, Encapsulated")
     ax.set_ylabel("Power (W)")
-    ax.set_title("Measured vs. Theoretical Array Power", fontweight="bold")
+    ax.set_title("Measured vs. Estimated Array Power", fontweight="bold")
     legend_outside(ax)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
@@ -937,7 +937,7 @@ def make_poa_strings_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     -- each string has its own surface normal (PANEL_NORMAL_BODY_STRING_0/_1),
     so the two can genuinely diverge whenever the aircraft's attitude favors
     one string's mounting angle over the other's, even though both see the
-    same clear-sky DNI. This is the modeled/theoretical-side counterpart to
+    same clear-sky DNI. This is the modeled/estimated-side counterpart to
     make_strings_plot()'s measured voltage/current -- separate plots because
     one is W/m^2 (irradiance model) and the other is V/A (electrical
     measurement); nothing here is compared against pv_power_w_<id> directly.
@@ -1017,7 +1017,7 @@ def main() -> None:
                          help="Max time gap allowed when matching a roll/pitch/yaw sample "
                               "(/zeus/flight) to an MPPT sample")
     parser.add_argument("--apply-temp-derate", action="store_true",
-                         help="Derate theoretical power using the datasheet's power temp "
+                         help="Derate estimated power using the datasheet's power temp "
                               "coefficient and the Tout proxy (fuselage skin temp). Off by "
                               "default -- see docstring for why this is opt-in.")
     parser.add_argument("--assume-horizontal", action="store_true",
