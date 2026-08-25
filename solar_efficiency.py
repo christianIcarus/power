@@ -87,20 +87,27 @@ Panel incidence angle (roll/pitch/yaw, always applied -- opt OUT with
 The array is mounted on a wing, not a fixed ground rack, so it's tilted
 by whatever the aircraft's attitude happens to be at each instant --
 banking into a turn can point it more squarely at the sun than a flat
-plate ever would, or away from it entirely. PANEL_NORMAL_BODY is the
-panel's surface normal in the aircraft's body frame (see that constant's
-comment for the full derivation from a CAD "direction vector" and how its
-coordinate convention was confirmed, not assumed, against the log's own
-attitude data). Each sample: panel_normal_ned() rotates that fixed body-
-frame vector into the earth (NED) frame using /zeus/flight's roll/pitch/
-yaw at that instant; cos_incidence_angle() then dots it against the sun's
-direction (sun_direction_ned()) to get cos(AOI), clipped to 0 when the sun
-is behind the panel. POA_irradiance = dni_w_m2 * cos(AOI) -- reusing the
+plate ever would, or away from it entirely. The two MPPT strings are
+mounted at slightly different angles, so each has its own surface normal
+in the aircraft's body frame -- PANEL_NORMAL_BODY_STRING_0 and _STRING_1
+(see that constant's comment for the full derivation from each string's
+CAD "direction vector" and how the shared coordinate convention was
+confirmed, not assumed, against the log's own attitude data). Each
+sample: panel_normal_ned() rotates a given body-frame normal into the
+earth (NED) frame using /zeus/flight's roll/pitch/yaw at that instant;
+cos_incidence_angle() then dots it against the sun's direction
+(sun_direction_ned()) to get cos(AOI), clipped to 0 when the sun is
+behind the panel. POA_irradiance = dni_w_m2 * cos(AOI) -- reusing the
 same clear-sky direct-beam value already computed for GHI, just projected
 onto the real orientation instead of assuming flat-horizontal. Samples
 with no attitude match fall back to cos(zenith) (flat) rather than NaN.
---assume-horizontal restores the old flat-plate behavior exactly (useful
-for comparison, or logs without /zeus/flight) by setting POA = GHI.
+The array-wide poa_w_m2 (efficiency calc, main plot) uses string 1's
+normal specifically; poa_string0_w_m2/poa_string1_w_m2 (see
+make_poa_strings_plot()) compute each string's POA separately for
+comparison -- combining both into a single per-string-weighted array POA
+would be a real improvement but isn't done here. --assume-horizontal
+restores the old flat-plate behavior exactly (useful for comparison, or
+logs without /zeus/flight) by setting every POA variant equal to GHI.
 
 Encapsulation transmission (always applied, NOT opt-in -- ETFE_TRANSMISSION
 and POE_TRANSMISSION, stacked): the light path from sun to cell isn't just
@@ -230,25 +237,31 @@ TEMP_FIELD = "tc_fuselage_outside_temp_c"          # Tout proxy -- see docstring
 TOUT_CLAMP_RANGE_C = (-40.0, 85.0)                 # defensive: generous aviation/electronics envelope
 FLIGHT_TOPIC = "/zeus/flight"                      # roll_deg/pitch_deg/yaw_deg -- see load_attitude()
 
-# Solar panel surface normal, in the aircraft's PX4 FRD body frame (+X
+# Solar panel surface normals, in the aircraft's PX4 FRD body frame (+X
 # forward/nose, +Y right/starboard, +Z down). Confirmed (2026-08-25) to be
 # /zeus/flight's own roll/pitch/yaw convention: cross-checked its reported
 # angles against Euler angles decomposed from vehicle_attitude's quaternion
 # (standard aerospace 3-2-1 sequence) across 122k matched samples on
 # 00007-2026-08-24_20-17-42.ulg -- r = 0.94-0.99, near-identical values.
 #
-# Given directly as a CAD "Direction vector" (X=0.144, Y=0, Z=0.99,
-# magnitude ~1.0004) in a frame where +X points toward the TAIL and +Z
-# points UP -- the opposite sign convention from PX4 FRD on both axes.
-# Since both frames are right-handed and share the same three physical
-# axes (longitudinal, spanwise, vertical), flipping X and Z but not Y is
-# the only PROPER rotation (determinant +1, a 180-degree turn about Y)
-# that reconciles them -- flipping all three, or only one, would mirror
-# rather than rotate, which two right-handed frames on the same rigid body
-# can never be related by:
-_PANEL_NORMAL_CAD = np.array([0.144, 0.0, 0.99])
-PANEL_NORMAL_BODY = np.array([-1.0, 1.0, -1.0]) * _PANEL_NORMAL_CAD
-PANEL_NORMAL_BODY = PANEL_NORMAL_BODY / np.linalg.norm(PANEL_NORMAL_BODY)
+# The two MPPT strings are mounted at slightly different angles, so each
+# gets its own normal, given directly as a CAD "Direction vector" (Y=0,
+# unstated both times, in both cases -- see string 1's original screenshot)
+# in a frame where +X points toward the TAIL and +Z points UP -- the
+# opposite sign convention from PX4 FRD on both axes. Since both frames are
+# right-handed and share the same three physical axes (longitudinal,
+# spanwise, vertical), flipping X and Z but not Y is the only PROPER
+# rotation (determinant +1, a 180-degree turn about Y) that reconciles them
+# -- flipping all three, or only one, would mirror rather than rotate,
+# which two right-handed frames on the same rigid body can never be
+# related by:
+def _panel_normal_body(x_cad: float, z_cad: float) -> np.ndarray:
+    v = np.array([-x_cad, 0.0, -z_cad])
+    return v / np.linalg.norm(v)
+
+
+PANEL_NORMAL_BODY_STRING_0 = _panel_normal_body(x_cad=0.263, z_cad=0.965)  # magnitude ~1.0002
+PANEL_NORMAL_BODY_STRING_1 = _panel_normal_body(x_cad=0.144, z_cad=0.99)   # magnitude ~1.0004
 
 
 def detect_launch_timezone(lat: float, lon: float) -> str:
@@ -362,7 +375,7 @@ def load_attitude(ulog: ULog) -> pd.DataFrame | None:
     /zeus/flight carries its own absolute-UTC timestamp_us field, the same
     convention as /zeus/mppt_* and /zeus/temperature. Its roll_deg/
     pitch_deg/yaw_deg are standard PX4 FRD body-frame Euler angles -- see
-    PANEL_NORMAL_BODY's comment for how that was confirmed, not assumed.
+    PANEL_NORMAL_BODY_STRING_0/_1's comment for how that was confirmed, not assumed.
     """
     f = _get_dataset(ulog, FLIGHT_TOPIC)
     if f is None:
@@ -455,15 +468,17 @@ def compute_clearsky_irradiance(times: pd.DatetimeIndex, lat: np.ndarray,
     return out
 
 
-def panel_normal_ned(roll_deg: np.ndarray, pitch_deg: np.ndarray, yaw_deg: np.ndarray) -> np.ndarray:
-    """Rotate PANEL_NORMAL_BODY into the NED earth frame, one rotation per sample.
+def panel_normal_ned(roll_deg: np.ndarray, pitch_deg: np.ndarray, yaw_deg: np.ndarray,
+                      normal_body: np.ndarray) -> np.ndarray:
+    """Rotate a body-frame panel normal (e.g. PANEL_NORMAL_BODY_STRING_0/_1)
+    into the NED earth frame, one rotation per sample.
 
     Standard aerospace body-to-NED rotation, 3-2-1 (yaw-pitch-roll) Euler
     sequence: R = Rz(yaw) @ Ry(pitch) @ Rx(roll). This is the same sequence
     used to confirm /zeus/flight's convention against vehicle_attitude's
-    quaternion (see PANEL_NORMAL_BODY) -- applied here to the constant body-
-    frame vector directly (closed-form per-sample), rather than building and
-    multiplying an (N, 3, 3) stack of rotation matrices.
+    quaternion (see PANEL_NORMAL_BODY_STRING_0/_1) -- applied here to the
+    constant body-frame vector directly (closed-form per-sample), rather
+    than building and multiplying an (N, 3, 3) stack of rotation matrices.
 
     Returns an (N, 3) array of unit vectors in NED (North, East, Down).
     """
@@ -471,7 +486,7 @@ def panel_normal_ned(roll_deg: np.ndarray, pitch_deg: np.ndarray, yaw_deg: np.nd
     cr, sr = np.cos(r), np.sin(r)
     cp, sp = np.cos(p), np.sin(p)
     cy, sy = np.cos(y), np.sin(y)
-    nx, ny, nz = PANEL_NORMAL_BODY
+    nx, ny, nz = normal_body
 
     ned_n = (cy * cp) * nx + (cy * sp * sr - sy * cr) * ny + (cy * sp * cr + sy * sr) * nz
     ned_e = (sy * cp) * nx + (sy * sp * sr + cy * cr) * ny + (sy * sp * cr - cy * sr) * nz
@@ -491,15 +506,20 @@ def sun_direction_ned(elevation_deg: np.ndarray, azimuth_deg: np.ndarray) -> np.
 
 
 def cos_incidence_angle(roll_deg: np.ndarray, pitch_deg: np.ndarray, yaw_deg: np.ndarray,
-                         elevation_deg: np.ndarray, azimuth_deg: np.ndarray) -> np.ndarray:
+                         elevation_deg: np.ndarray, azimuth_deg: np.ndarray,
+                         normal_body: np.ndarray) -> np.ndarray:
     """cos(AOI) between the tilted, rotating panel and the sun -- 0 where the
     sun is behind the panel (no direct beam reaches it), never negative.
+
+    normal_body selects which panel's normal to use (e.g.
+    PANEL_NORMAL_BODY_STRING_0 or _STRING_1 -- the two MPPT strings are
+    mounted at slightly different angles, see that constant's comment).
 
     Where attitude is NaN (no /zeus/flight match for that sample), falls
     back to cos(zenith) -- i.e. the flat-horizontal assumption -- rather
     than propagating NaN into the theoretical-power calc for that row.
     """
-    normal = panel_normal_ned(roll_deg, pitch_deg, yaw_deg)
+    normal = panel_normal_ned(roll_deg, pitch_deg, yaw_deg, normal_body)
     sun = sun_direction_ned(elevation_deg, azimuth_deg)
     cos_aoi = np.einsum("ij,ij->i", normal, sun)
     cos_zenith_fallback = np.sin(np.radians(elevation_deg))  # cos(zenith) == sin(elevation)
@@ -621,19 +641,32 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
     merged = merged.join(irr)
 
     # Plane-of-array irradiance: the panel isn't flat/horizontal (see
-    # PANEL_NORMAL_BODY), so project the direct beam onto the actual,
-    # rotating panel normal instead of assuming it always faces straight up.
-    # ghi_w_m2 (flat-plate) is kept as-is for comparison; poa_w_m2 is what
-    # actually drives pv_power_theoretical_bare_w below, unless
-    # --assume-horizontal was passed (in which case poa_w_m2 == ghi_w_m2).
+    # PANEL_NORMAL_BODY_STRING_0/_1), so project the direct beam onto the
+    # actual, rotating panel normal instead of assuming it always faces
+    # straight up. ghi_w_m2 (flat-plate) is kept as-is for comparison;
+    # poa_w_m2 is what actually drives pv_power_theoretical_bare_w below,
+    # unless --assume-horizontal was passed (in which case poa_w_m2 ==
+    # ghi_w_m2). poa_w_m2 uses string 1's normal specifically -- it's the
+    # array-wide POA the rest of the pipeline (efficiency, main plot) has
+    # always used; poa_string0_w_m2/poa_string1_w_m2 below are for the
+    # dedicated per-string comparison plot, not for the summary/efficiency
+    # numbers. Combining the two strings' actual differing orientations into
+    # one array-wide POA would be a real improvement but is out of scope
+    # here -- see PANEL_NORMAL_BODY_STRING_0/_1 comment.
     if args.assume_horizontal:
         merged["poa_w_m2"] = merged["ghi_w_m2"]
+        merged["poa_string0_w_m2"] = merged["ghi_w_m2"]
+        merged["poa_string1_w_m2"] = merged["ghi_w_m2"]
     else:
-        cos_aoi = cos_incidence_angle(
-            merged["roll_deg"].values, merged["pitch_deg"].values, merged["yaw_deg"].values,
-            merged["sun_elevation_deg"].values, merged["sun_azimuth_deg"].values,
-        )
-        merged["poa_w_m2"] = merged["dni_w_m2"] * cos_aoi
+        roll, pitch, yaw = merged["roll_deg"].values, merged["pitch_deg"].values, merged["yaw_deg"].values
+        elevation, azimuth = merged["sun_elevation_deg"].values, merged["sun_azimuth_deg"].values
+        cos_aoi_string0 = cos_incidence_angle(roll, pitch, yaw, elevation, azimuth,
+                                               normal_body=PANEL_NORMAL_BODY_STRING_0)
+        cos_aoi_string1 = cos_incidence_angle(roll, pitch, yaw, elevation, azimuth,
+                                               normal_body=PANEL_NORMAL_BODY_STRING_1)
+        merged["poa_string0_w_m2"] = merged["dni_w_m2"] * cos_aoi_string0
+        merged["poa_string1_w_m2"] = merged["dni_w_m2"] * cos_aoi_string1
+        merged["poa_w_m2"] = merged["poa_string1_w_m2"]
 
     # Optional temperature derating: factor = 1 + coeff%/degC * (Tout - STC_TEMP_C).
     # coeff is negative, so Tout ABOVE STC_TEMP_C (25 degC) is a LOSS
@@ -776,6 +809,20 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
         ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.06, 1.0), borderaxespad=0.0)
 
     ax = axes[0]
+    ax.plot(df.index, df["alt_msl_m"], color="tab:purple", label="Altitude (MSL)")
+    ax.set_ylabel("Altitude MSL (m)")
+    if has_tout:
+        ax2 = ax.twinx()
+        ax2.plot(df.index, df["tout_c"], color="tab:brown", label="Fuselage Skin Temp (Tout Proxy)")
+        ax2.axhline(STC_TEMP_C, color="black", linewidth=0.8, linestyle=":", label=f"STC ({STC_TEMP_C:.0f} degC)")
+        ax2.set_ylabel("Temp (degC)")
+        ax.set_title("Environmentals", fontweight="bold")
+        legend_outside(ax, ax2)
+    else:
+        ax.set_title("Environmentals", fontweight="bold")
+        legend_outside(ax)
+
+    ax = axes[1]
     ax.plot(df.index, df["ghi_w_m2"], color="tab:orange", alpha=0.6,
             label="Modeled Clear-Sky GHI @ Lat/Lon/Alt (Flat, Horizontal)")
     ax.plot(df.index, df["poa_w_m2"], color="tab:red",
@@ -789,19 +836,35 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
 
     has_derate = "pv_power_theoretical_nominal_w" in df.columns
 
-    ax = axes[1]
+    ax = axes[2]
     ax.plot(df.index, df["pv_power_actual_w"], color="tab:blue", label="Measured Pre-MPPT Power")
-    # Bare-cell ceiling, the pre-temp-derate "No Temp Derate" curves, and the
-    # temp derate loss/gain shading are all computed and still exported to
-    # the CSV (pv_power_theoretical_bare_w / _nominal_w), but hidden from the
-    # plot itself (2026-08-25) to declutter it now that there are several
-    # theoretical tiers -- only the final Theoretical, Temp-Derated curve
-    # (which already has bare/ETFE/POE/tilt all baked in) is drawn against
-    # Measured. See print_summary()'s "Temp derate effect" line for the
-    # loss/gain magnitude instead of reading it off the plot.
+    # Bare-cell ceiling (no ETFE, no POE, no temp derate) is always drawn as
+    # a thin reference line -- not physically real for this array, but it's
+    # the only way to see the encapsulation stack's loss on the plot when
+    # temp derating is off (in that case "nominal"/"theoretical" below are
+    # the same curve).
+    ax.plot(df.index, df["pv_power_theoretical_bare_w"], color="tab:gray", linestyle=":",
+            alpha=0.6, label="Theoretical, No Temp Derate, Bare Cells")
     if has_derate:
+        ax.plot(df.index, df["pv_power_theoretical_nominal_w"], color="tab:green", linestyle="--",
+                alpha=0.6, label="Theoretical, No Temp Derate, Encapsulated")
         ax.plot(df.index, df["pv_power_theoretical_w"], color="tab:olive", linestyle="-.",
-                label="Theoretical, Temp-Derated")
+                label="Theoretical, Temp-Derated, Encapsulated")
+        # Tout above STC (25 degC) is a LOSS (derated < nominal); Tout below
+        # STC is a GAIN (derated > nominal) since the coefficient is
+        # negative -- shade/label each region distinctly rather than
+        # assuming it's always a loss. Only label a region if it actually
+        # occurs, so the legend doesn't show an entry with no matching area.
+        derated = df["pv_power_theoretical_w"]
+        nominal = df["pv_power_theoretical_nominal_w"]
+        is_loss = derated < nominal
+        is_gain = derated > nominal
+        ax.fill_between(df.index, derated, nominal, where=is_loss, interpolate=True,
+                         color="tab:red", alpha=0.15,
+                         label="Temp Derate Loss" if is_loss.any() else None)
+        ax.fill_between(df.index, derated, nominal, where=is_gain, interpolate=True,
+                         color="tab:cyan", alpha=0.15,
+                         label="Temp Derate Gain" if is_gain.any() else None)
     else:
         # pv_power_theoretical_w already has the ETFE loss baked in (see
         # analyze()), so it IS the "No Temp Derate, Encapsulated" tier here --
@@ -811,20 +874,6 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     ax.set_ylabel("Power (W)")
     ax.set_title("Measured vs. Theoretical Array Power", fontweight="bold")
     legend_outside(ax)
-
-    ax = axes[2]
-    ax.plot(df.index, df["alt_msl_m"], color="tab:purple", label="Altitude (MSL)")
-    ax.set_ylabel("Altitude MSL (m)")
-    if has_tout:
-        ax2 = ax.twinx()
-        ax2.plot(df.index, df["tout_c"], color="tab:brown", label="Fuselage Skin Temp (Tout Proxy)")
-        ax2.axhline(STC_TEMP_C, color="black", linewidth=0.8, linestyle=":", label=f"STC ({STC_TEMP_C:.0f} degC)")
-        ax2.set_ylabel("Temp (degC)")
-        ax.set_title("Environmentals", fontweight="bold")
-        legend_outside(ax, ax2)
-    else:
-        ax.set_title("Environmentals", fontweight="bold")
-        legend_outside(ax)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
     axes[-1].set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
@@ -878,6 +927,36 @@ def make_strings_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
     axes[-1].set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved plot -> {out_path}")
+
+
+def make_poa_strings_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
+    """Modeled POA irradiance per string (poa_string0_w_m2 vs poa_string1_w_m2)
+    -- each string has its own surface normal (PANEL_NORMAL_BODY_STRING_0/_1),
+    so the two can genuinely diverge whenever the aircraft's attitude favors
+    one string's mounting angle over the other's, even though both see the
+    same clear-sky DNI. This is the modeled/theoretical-side counterpart to
+    make_strings_plot()'s measured voltage/current -- separate plots because
+    one is W/m^2 (irradiance model) and the other is V/A (electrical
+    measurement); nothing here is compared against pv_power_w_<id> directly.
+    """
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    local_index = df.index.tz_convert(tz)
+    df = df.set_axis(local_index)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(df.index, df["poa_string0_w_m2"], color="tab:blue", label="String 0 POA Irradiance")
+    ax.plot(df.index, df["poa_string1_w_m2"], color="tab:orange", label="String 1 POA Irradiance")
+    ax.set_ylabel("POA Irradiance (W/m^2)")
+    ax.set_title("Modeled Plane-of-Array Irradiance, String 0 vs String 1", fontweight="bold")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
+    ax.set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved plot -> {out_path}")
@@ -972,7 +1051,7 @@ def main() -> None:
     csv_path = out_dir / f"{stem}_solar_efficiency.csv"
     export_cols = [
         "lat", "lon", "alt_msl_m", "sun_elevation_deg", "sun_azimuth_deg",
-        "ghi_w_m2", "dni_w_m2", "dhi_w_m2", "poa_w_m2",
+        "ghi_w_m2", "dni_w_m2", "dhi_w_m2", "poa_w_m2", "poa_string0_w_m2", "poa_string1_w_m2",
         *(["roll_deg", "pitch_deg", "yaw_deg"] if "roll_deg" in df.columns else []),
         *(["tout_c"] if "tout_c" in df.columns else []),
         *[c for c in df.columns if c.startswith("pv_")],
@@ -992,6 +1071,11 @@ def main() -> None:
         make_strings_plot(df, strings_plot_path, tz)
         if not args.no_open:
             open_in_vscode(strings_plot_path)
+
+        poa_strings_plot_path = out_dir / f"{stem}_poa_strings.png"
+        make_poa_strings_plot(df, poa_strings_plot_path, tz)
+        if not args.no_open:
+            open_in_vscode(poa_strings_plot_path)
 
 
 if __name__ == "__main__":
