@@ -31,9 +31,21 @@ Cell reference data (Maxeon Gen 7 datasheet, 546209 Rev C):
     25 degC increases it (a gain). The code, plot, and summary all handle
     both signs -- don't assume derating only ever shrinks power.
 
-Theoretical/available array power at each instant is:
+Theoretical/available array power at each instant is layered in three tiers,
+each one a further loss on top of the last (see "Encapsulation transmission"
+and "Temperature derating" below for the middle and last terms):
 
-    P_theoretical(t) = GHI_clearsky(t) [W/m^2] * total_cell_area [m^2] * cell_efficiency [* temp_derate_factor(t)]
+    P_bare(t)        = GHI_clearsky(t) [W/m^2] * total_cell_area [m^2] * cell_efficiency
+    P_no_temp_derate(t) = P_bare(t) * etfe_transmission * poe_transmission
+    P_theoretical(t) = P_no_temp_derate(t) [* temp_derate_factor(t)]
+
+P_bare is the cell nameplate ceiling with nothing between the sun and the
+cells -- not physically real for this array, but a useful "no losses at
+all" reference. P_no_temp_derate adds the encapsulation stack's light loss
+(ETFE cover + POE encapsulant, both always applied, not opt-in) and is what
+"efficiency" is actually measured against when --apply-temp-derate is off.
+P_theoretical is the final number used everywhere once temp derating is
+added on top.
 
 GHI_clearsky is modeled with a Beer-Lambert atmospheric attenuation model,
 driven by the *aircraft's* lat/lon/altitude/time at each sample -- not a
@@ -62,6 +74,31 @@ product or a nearby ground station) rather than pure clear-sky modeling.
 Aircraft attitude (/zeus/flight has pitch_deg/roll_deg/yaw_deg) remains a
 secondary, empirically minor caveat on top of that.
 
+Encapsulation transmission (always applied, NOT opt-in -- ETFE_TRANSMISSION
+and POE_TRANSMISSION, stacked): the light path from sun to cell isn't just
+open air -- it passes through an ETFE outer film AND a POE encapsulant
+layer bonding the cells underneath it, and each layer's loss compounds:
+    encapsulation_transmission = etfe_transmission * poe_transmission
+ETFE_TRANSMISSION is a SPECTRALLY-WEIGHTED average, not a flat datasheet
+number: a flat "% transmission" would overstate the loss that matters
+electrically, since the cell doesn't respond equally to every wavelength
+and the sun doesn't deliver equal power at every wavelength either. So
+it's transmission(lambda) weighted by [cell EQE(lambda) x AM1.5G solar
+spectral irradiance(lambda)], summed over wavelength -- a wavelength the
+cell can't use, or where the sun delivers almost no energy there, barely
+moves the number even if the film transmits it poorly (or well). Source
+data: a manufacturer ETFE light-transmission chart (%T, 200-870 nm) and a
+Maxeon spectral-response chart (EQE % + the ASTM G173-03 "global tilt"
+AM1.5G reference spectrum it was measured against, both 300-1200 nm). Both
+were hand-digitized off chart images (no source data file), and the ETFE
+curve's 870-1100 nm tail (past its chart's right edge, but still inside
+the cell's response range) was extrapolated flat at its last plotted
+value -- override with --etfe-transmission if better data turns up.
+POE_TRANSMISSION (0.92) is a single flat figure (user-supplied, 2026-08-25)
+-- no spectral chart was given for it, so unlike ETFE it isn't wavelength-
+weighted against the cell's response. Override with --poe-transmission if
+a spectral curve for it ever shows up and is worth digitizing the same way.
+
 Temperature derating (Tout proxy, opt-in via --apply-temp-derate):
 No field literally named "Tout"/"OAT" exists in this log. Considered and
 rejected: /zeus/aeroprobe.temp_external_c (dead sentinel 999.0 for the whole
@@ -82,6 +119,7 @@ Usage:
     python solar_efficiency.py --ulog log.ulg --no-plot
     python solar_efficiency.py --ulog log.ulg --cell-count 72 --cell-efficiency 0.254
     python solar_efficiency.py --ulog log.ulg --apply-temp-derate
+    python solar_efficiency.py --ulog log.ulg --etfe-transmission 0.93
 """
 
 from __future__ import annotations
@@ -121,6 +159,40 @@ STC_IRRADIANCE_W_M2 = 1000.0
 # arbitrarily close to but can never exceed toa_irradiance * cos(zenith) at
 # any altitude. Ineichen's altitude term has no equivalent ceiling.
 SEA_LEVEL_TRANSMITTANCE = 0.70
+
+# ETFE array-cover light transmission, spectrally-weighted -- see the
+# "Encapsulation transmission" docstring section above for the why. The table
+# below is the actual hand-digitized data behind the number, kept here (not
+# just the final scalar) so the derivation can be audited/redone if better
+# source data shows up. Columns: wavelength [nm], AM1.5G global-tilt solar
+# spectral irradiance [W/m^2/nm] (ASTM G173-03), Maxeon cell EQE [fraction],
+# ETFE transmission [fraction] (flat-extrapolated past 850 nm -- see above).
+_ETFE_SPECTRAL_DATA = [
+    # wl_nm, am15g_w_m2_nm, maxeon_eqe, etfe_transmission
+    (300, 0.05, 0.65, 0.895), (350, 0.50, 0.80, 0.900), (400, 1.10, 0.90, 0.905),
+    (450, 1.70, 0.96, 0.915), (500, 1.85, 0.98, 0.920), (550, 1.75, 0.99, 0.925),
+    (600, 1.60, 0.99, 0.930), (650, 1.50, 0.99, 0.935), (700, 1.40, 0.98, 0.940),
+    (750, 1.20, 0.97, 0.940), (800, 1.10, 0.95, 0.945), (850, 0.97, 0.92, 0.945),
+    (900, 0.85, 0.85, 0.945), (950, 0.70, 0.70, 0.945), (1000, 0.85, 0.45, 0.945),
+    (1050, 0.75, 0.20, 0.945), (1100, 0.70, 0.05, 0.945),
+]
+
+
+def _spectrally_weighted_etfe_transmission() -> float:
+    """T_eff = sum(T(lambda) * EQE(lambda) * AM1.5G(lambda)) / sum(EQE(lambda) * AM1.5G(lambda))."""
+    weight_sum = sum(am15g * eqe for _, am15g, eqe, _ in _ETFE_SPECTRAL_DATA)
+    weighted_transmission = sum(am15g * eqe * t for _, am15g, eqe, t in _ETFE_SPECTRAL_DATA)
+    return weighted_transmission / weight_sum
+
+
+DEFAULT_ETFE_TRANSMISSION = round(_spectrally_weighted_etfe_transmission(), 4)  # ~0.93
+
+# POE encapsulant light transmission -- the layer bonding the cells that sits
+# UNDER the ETFE cover, so its loss stacks with ETFE_TRANSMISSION rather than
+# replacing it (see "Encapsulation transmission" docstring section). Flat
+# figure (user-supplied, 2026-08-25), not spectrally-weighted like ETFE
+# above -- no spectral transmission chart was provided for it.
+DEFAULT_POE_TRANSMISSION = 0.92
 
 GPS_TOPIC = "vehicle_gps_position"
 MPPT_TOPICS = ("/zeus/mppt_0", "/zeus/mppt_1")
@@ -416,12 +488,20 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
     else:
         merged["temp_derate_factor"] = 1.0
 
-    # Theoretical array output = irradiance * total cell area * cell efficiency
-    # [* optional temperature derate factor]. When derating is on, keep the
-    # undated "nominal" curve around too so the plot can show both and make
-    # the derate's effect visible.
+    # Theoretical array output, three tiers (see module docstring for the
+    # full breakdown): bare-cell ceiling -> encapsulation loss (ETFE cover x
+    # POE encapsulant, both always applied, stacked -- see "Encapsulation
+    # transmission") -> optional temp derate. Bare is kept around
+    # unconditionally as a reference curve; the encapsulated "nominal" is
+    # only kept as its own column when temp derating is on, so the plot can
+    # show all three and make the derate's effect visible on top of the
+    # (already-applied) encapsulation loss -- when derating is off, nominal
+    # IS the final theoretical number.
     total_area_m2 = args.cell_count * args.cell_area_cm2 / 1e4
-    nominal_w = merged["ghi_w_m2"] * total_area_m2 * args.cell_efficiency
+    bare_w = merged["ghi_w_m2"] * total_area_m2 * args.cell_efficiency
+    merged["pv_power_theoretical_bare_w"] = bare_w
+    encapsulation_transmission = args.etfe_transmission * args.poe_transmission
+    nominal_w = bare_w * encapsulation_transmission
     if args.apply_temp_derate:
         merged["pv_power_theoretical_nominal_w"] = nominal_w
         merged["pv_power_theoretical_w"] = nominal_w * merged["temp_derate_factor"]
@@ -465,7 +545,10 @@ def print_summary(df: pd.DataFrame, args: argparse.Namespace, tz: str) -> None:
     print(f"Samples analyzed         : {len(df)}  ({len(daylight)} with sun above horizon)")
     print(f"Cells / area / eff.      : {args.cell_count} x {args.cell_area_cm2:.0f} cm^2 "
           f"@ {args.cell_efficiency * 100:.1f}%  -> {df.attrs['total_area_m2']:.3f} m^2 total")
-    print(f"STC-rated array power    : {rated_stc_w:.1f} W  (at 1000 W/m^2, 25 degC)")
+    print(f"Encapsulation transmission: ETFE {args.etfe_transmission * 100:.1f}% x POE "
+          f"{args.poe_transmission * 100:.1f}% = {args.etfe_transmission * args.poe_transmission * 100:.1f}%  "
+          f"(always applied -- see docstring)")
+    print(f"STC-rated array power    : {rated_stc_w:.1f} W  (at 1000 W/m^2, 25 degC, bare cells)")
     print(f"Peak measured PV power   : {df['pv_power_actual_w'].max():.1f} W")
     print(f"Peak modeled GHI         : {df['ghi_w_m2'].max():.1f} W/m^2")
     print(f"Peak sun elevation       : {df['sun_elevation_deg'].max():.1f} deg")
@@ -528,9 +611,15 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
 
     ax = axes[1]
     ax.plot(df.index, df["pv_power_actual_w"], color="tab:blue", label="Measured Pre-MPPT Power")
+    # Bare-cell ceiling (no ETFE, no temp derate) is always drawn as a thin
+    # reference line -- not physically real for this array, but it's the
+    # only way to see the ETFE cover's loss on the plot when temp derating
+    # is off (in that case "nominal"/"theoretical" below are the same curve).
+    ax.plot(df.index, df["pv_power_theoretical_bare_w"], color="tab:gray", linestyle=":",
+            alpha=0.6, label="Theoretical, No Temp Derate, Bare Cells")
     if has_derate:
         ax.plot(df.index, df["pv_power_theoretical_nominal_w"], color="tab:green", linestyle="--",
-                alpha=0.6, label="Theoretical, No Temp Derate")
+                alpha=0.6, label="Theoretical, No Temp Derate, Encapsulated")
         ax.plot(df.index, df["pv_power_theoretical_w"], color="tab:olive", linestyle="-.",
                 label="Theoretical, Temp-Derated")
         # Tout above STC (25 degC) is a LOSS (derated < nominal); Tout below
@@ -549,8 +638,11 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
                          color="tab:cyan", alpha=0.15,
                          label="Temp Derate Gain" if is_gain.any() else None)
     else:
+        # pv_power_theoretical_w already has the ETFE loss baked in (see
+        # analyze()), so it IS the "No Temp Derate, Encapsulated" tier here --
+        # there's no separate nominal column to plot on top of the bare-cell line.
         ax.plot(df.index, df["pv_power_theoretical_w"], color="tab:green", linestyle="--",
-                label="Theoretical (GHI x Area x Cell Eff.)")
+                label="Theoretical, No Temp Derate, Encapsulated")
     ax.set_ylabel("Power (W)")
     ax.set_title("Measured vs. Theoretical Array Power", fontweight="bold")
     legend_outside(ax)
@@ -611,6 +703,15 @@ def main() -> None:
     parser.add_argument("--cell-area-cm2", type=float, default=DEFAULT_CELL_AREA_CM2)
     parser.add_argument("--cell-efficiency", type=float, default=DEFAULT_CELL_EFFICIENCY,
                          help="Fractional cell efficiency, e.g. 0.254 for 25.4%%")
+    parser.add_argument("--etfe-transmission", type=float, default=DEFAULT_ETFE_TRANSMISSION,
+                         help="Fractional light transmission through the ETFE array cover, "
+                              "spectrally-weighted by cell EQE x AM1.5G spectrum (see "
+                              "docstring). Always applied, not opt-in like --apply-temp-derate. "
+                              f"Default {DEFAULT_ETFE_TRANSMISSION:.2f}.")
+    parser.add_argument("--poe-transmission", type=float, default=DEFAULT_POE_TRANSMISSION,
+                         help="Fractional light transmission through the POE encapsulant "
+                              "(stacks with --etfe-transmission -- see docstring). Flat figure, "
+                              f"not spectrally-weighted. Always applied. Default {DEFAULT_POE_TRANSMISSION:.2f}.")
     parser.add_argument("--gps-tolerance-s", type=float, default=2.0,
                          help="Max time gap allowed when matching a GPS fix to an MPPT sample")
     parser.add_argument("--mppt-sync-tolerance-s", type=float, default=0.5,
