@@ -19,6 +19,9 @@ Data used from the log (see e.g. 2026_08_10_SN30solarRT.ulg):
   - /zeus/temperature      -> tc_fuselage_outside_temp_c (Tout proxy; see
                               caveat below). Used only when --apply-temp-derate
                               is passed.
+  - /zeus/flight           -> roll_deg, pitch_deg, yaw_deg. Used for the panel
+                              incidence-angle correction (see "Panel incidence
+                              angle" below); skipped under --assume-horizontal.
 
 Cell reference data (Maxeon Gen 7 datasheet, 546209 Rev C):
   - Cell area       : ~155 cm^2 per cell
@@ -32,10 +35,10 @@ Cell reference data (Maxeon Gen 7 datasheet, 546209 Rev C):
     both signs -- don't assume derating only ever shrinks power.
 
 Theoretical/available array power at each instant is layered in three tiers,
-each one a further loss on top of the last (see "Encapsulation transmission"
-and "Temperature derating" below for the middle and last terms):
+each one a further loss on top of the last (see "Panel incidence angle",
+"Encapsulation transmission", and "Temperature derating" below for each term):
 
-    P_bare(t)        = GHI_clearsky(t) [W/m^2] * total_cell_area [m^2] * cell_efficiency
+    P_bare(t)        = POA_irradiance(t) [W/m^2] * total_cell_area [m^2] * cell_efficiency
     P_no_temp_derate(t) = P_bare(t) * etfe_transmission * poe_transmission
     P_theoretical(t) = P_no_temp_derate(t) [* temp_derate_factor(t)]
 
@@ -46,6 +49,11 @@ all" reference. P_no_temp_derate adds the encapsulation stack's light loss
 "efficiency" is actually measured against when --apply-temp-derate is off.
 P_theoretical is the final number used everywhere once temp derating is
 added on top.
+
+POA_irradiance (plane-of-array) is the clear-sky direct beam projected onto
+the ACTUAL panel orientation -- not a flat horizontal assumption -- unless
+--assume-horizontal is passed, in which case it falls back to GHI_clearsky
+(irradiance on a plate facing straight up). See "Panel incidence angle".
 
 GHI_clearsky is modeled with a Beer-Lambert atmospheric attenuation model,
 driven by the *aircraft's* lat/lon/altitude/time at each sample -- not a
@@ -73,6 +81,26 @@ a rigorous version would need real cloud-cover data (satellite irradiance
 product or a nearby ground station) rather than pure clear-sky modeling.
 Aircraft attitude (/zeus/flight has pitch_deg/roll_deg/yaw_deg) remains a
 secondary, empirically minor caveat on top of that.
+
+Panel incidence angle (roll/pitch/yaw, always applied -- opt OUT with
+--assume-horizontal, the reverse of --apply-temp-derate's opt-IN):
+The array is mounted on a wing, not a fixed ground rack, so it's tilted
+by whatever the aircraft's attitude happens to be at each instant --
+banking into a turn can point it more squarely at the sun than a flat
+plate ever would, or away from it entirely. PANEL_NORMAL_BODY is the
+panel's surface normal in the aircraft's body frame (see that constant's
+comment for the full derivation from a CAD "direction vector" and how its
+coordinate convention was confirmed, not assumed, against the log's own
+attitude data). Each sample: panel_normal_ned() rotates that fixed body-
+frame vector into the earth (NED) frame using /zeus/flight's roll/pitch/
+yaw at that instant; cos_incidence_angle() then dots it against the sun's
+direction (sun_direction_ned()) to get cos(AOI), clipped to 0 when the sun
+is behind the panel. POA_irradiance = dni_w_m2 * cos(AOI) -- reusing the
+same clear-sky direct-beam value already computed for GHI, just projected
+onto the real orientation instead of assuming flat-horizontal. Samples
+with no attitude match fall back to cos(zenith) (flat) rather than NaN.
+--assume-horizontal restores the old flat-plate behavior exactly (useful
+for comparison, or logs without /zeus/flight) by setting POA = GHI.
 
 Encapsulation transmission (always applied, NOT opt-in -- ETFE_TRANSMISSION
 and POE_TRANSMISSION, stacked): the light path from sun to cell isn't just
@@ -120,6 +148,7 @@ Usage:
     python solar_efficiency.py --ulog log.ulg --cell-count 72 --cell-efficiency 0.254
     python solar_efficiency.py --ulog log.ulg --apply-temp-derate
     python solar_efficiency.py --ulog log.ulg --etfe-transmission 0.93
+    python solar_efficiency.py --ulog log.ulg --assume-horizontal
 """
 
 from __future__ import annotations
@@ -199,6 +228,27 @@ MPPT_TOPICS = ("/zeus/mppt_0", "/zeus/mppt_1")
 TEMP_TOPIC = "/zeus/temperature"
 TEMP_FIELD = "tc_fuselage_outside_temp_c"          # Tout proxy -- see docstring caveat
 TOUT_CLAMP_RANGE_C = (-40.0, 85.0)                 # defensive: generous aviation/electronics envelope
+FLIGHT_TOPIC = "/zeus/flight"                      # roll_deg/pitch_deg/yaw_deg -- see load_attitude()
+
+# Solar panel surface normal, in the aircraft's PX4 FRD body frame (+X
+# forward/nose, +Y right/starboard, +Z down). Confirmed (2026-08-25) to be
+# /zeus/flight's own roll/pitch/yaw convention: cross-checked its reported
+# angles against Euler angles decomposed from vehicle_attitude's quaternion
+# (standard aerospace 3-2-1 sequence) across 122k matched samples on
+# 00007-2026-08-24_20-17-42.ulg -- r = 0.94-0.99, near-identical values.
+#
+# Given directly as a CAD "Direction vector" (X=0.144, Y=0, Z=0.99,
+# magnitude ~1.0004) in a frame where +X points toward the TAIL and +Z
+# points UP -- the opposite sign convention from PX4 FRD on both axes.
+# Since both frames are right-handed and share the same three physical
+# axes (longitudinal, spanwise, vertical), flipping X and Z but not Y is
+# the only PROPER rotation (determinant +1, a 180-degree turn about Y)
+# that reconciles them -- flipping all three, or only one, would mirror
+# rather than rotate, which two right-handed frames on the same rigid body
+# can never be related by:
+_PANEL_NORMAL_CAD = np.array([0.144, 0.0, 0.99])
+PANEL_NORMAL_BODY = np.array([-1.0, 1.0, -1.0]) * _PANEL_NORMAL_CAD
+PANEL_NORMAL_BODY = PANEL_NORMAL_BODY / np.linalg.norm(PANEL_NORMAL_BODY)
 
 
 def detect_launch_timezone(lat: float, lon: float) -> str:
@@ -306,6 +356,31 @@ def load_temperature(ulog: ULog) -> pd.DataFrame | None:
     return df.drop(columns="time_utc_us").drop_duplicates("time").set_index("time").sort_index()
 
 
+def load_attitude(ulog: ULog) -> pd.DataFrame | None:
+    """Aircraft roll/pitch/yaw, used for the panel incidence-angle correction.
+
+    /zeus/flight carries its own absolute-UTC timestamp_us field, the same
+    convention as /zeus/mppt_* and /zeus/temperature. Its roll_deg/
+    pitch_deg/yaw_deg are standard PX4 FRD body-frame Euler angles -- see
+    PANEL_NORMAL_BODY's comment for how that was confirmed, not assumed.
+    """
+    f = _get_dataset(ulog, FLIGHT_TOPIC)
+    if f is None:
+        print(f"  (note: {FLIGHT_TOPIC} not present in this log - panel incidence-angle "
+              f"correction disabled, falling back to a flat horizontal assumption)")
+        return None
+    df = pd.DataFrame(
+        {
+            "time_utc_us": f.data["timestamp_us"],
+            "roll_deg": f.data["roll_deg"],
+            "pitch_deg": f.data["pitch_deg"],
+            "yaw_deg": f.data["yaw_deg"],
+        }
+    )
+    df["time"] = pd.to_datetime(df["time_utc_us"], unit="us", utc=True)
+    return df.drop(columns="time_utc_us").drop_duplicates("time").set_index("time").sort_index()
+
+
 # --------------------------------------------------------------------------
 # Solar geometry / clear-sky irradiance
 # --------------------------------------------------------------------------
@@ -341,11 +416,14 @@ def compute_clearsky_irradiance(times: pd.DatetimeIndex, lat: np.ndarray,
     (Beer-Lambert attenuation -- see SEA_LEVEL_TRANSMITTANCE for why, not
     pvlib's Ineichen/Perez model).
 
-    dni_w_m2/dhi_w_m2 are a simplified all-beam/no-diffuse split for the CSV
-    export only -- this model doesn't compute diffuse sky radiation
-    separately (it was a ~1% contribution even under the old Ineichen model
-    at this flight's altitudes). ghi_w_m2 is the only one of the three that
-    feeds the theoretical-power calc, summary, and plot.
+    dni_w_m2/dhi_w_m2 are a simplified all-beam/no-diffuse split -- this
+    model doesn't compute diffuse sky radiation separately (it was a ~1%
+    contribution even under the old Ineichen model at this flight's
+    altitudes). ghi_w_m2 assumes a flat HORIZONTAL surface (irradiance on
+    a plate facing straight up); it's kept as a reference curve, but
+    poa_w_m2 (derived from dni_w_m2 via panel_normal_ned(), see below) is
+    what actually drives the theoretical-power calc unless
+    --assume-horizontal is passed.
     """
     solpos = pvlib.solarposition.get_solarposition(times, lat, lon, altitude=alt_m)
     cos_zenith = np.cos(np.radians(solpos["apparent_zenith"].values))
@@ -377,6 +455,58 @@ def compute_clearsky_irradiance(times: pd.DatetimeIndex, lat: np.ndarray,
     return out
 
 
+def panel_normal_ned(roll_deg: np.ndarray, pitch_deg: np.ndarray, yaw_deg: np.ndarray) -> np.ndarray:
+    """Rotate PANEL_NORMAL_BODY into the NED earth frame, one rotation per sample.
+
+    Standard aerospace body-to-NED rotation, 3-2-1 (yaw-pitch-roll) Euler
+    sequence: R = Rz(yaw) @ Ry(pitch) @ Rx(roll). This is the same sequence
+    used to confirm /zeus/flight's convention against vehicle_attitude's
+    quaternion (see PANEL_NORMAL_BODY) -- applied here to the constant body-
+    frame vector directly (closed-form per-sample), rather than building and
+    multiplying an (N, 3, 3) stack of rotation matrices.
+
+    Returns an (N, 3) array of unit vectors in NED (North, East, Down).
+    """
+    r, p, y = np.radians(roll_deg), np.radians(pitch_deg), np.radians(yaw_deg)
+    cr, sr = np.cos(r), np.sin(r)
+    cp, sp = np.cos(p), np.sin(p)
+    cy, sy = np.cos(y), np.sin(y)
+    nx, ny, nz = PANEL_NORMAL_BODY
+
+    ned_n = (cy * cp) * nx + (cy * sp * sr - sy * cr) * ny + (cy * sp * cr + sy * sr) * nz
+    ned_e = (sy * cp) * nx + (sy * sp * sr + cy * cr) * ny + (sy * sp * cr - cy * sr) * nz
+    ned_d = (-sp) * nx + (cp * sr) * ny + (cp * cr) * nz
+    return np.stack([ned_n, ned_e, ned_d], axis=-1)
+
+
+def sun_direction_ned(elevation_deg: np.ndarray, azimuth_deg: np.ndarray) -> np.ndarray:
+    """Unit vector FROM the aircraft TOWARD the sun, in the NED earth frame.
+
+    pvlib's azimuth (clockwise from north: 0=N, 90=E, 180=S, 270=W) maps
+    directly onto NED's N/E axes. NED's "down" is positive, so "toward the
+    sun" (above the horizon) has a NEGATIVE down-component.
+    """
+    el, az = np.radians(elevation_deg), np.radians(azimuth_deg)
+    return np.stack([np.cos(el) * np.cos(az), np.cos(el) * np.sin(az), -np.sin(el)], axis=-1)
+
+
+def cos_incidence_angle(roll_deg: np.ndarray, pitch_deg: np.ndarray, yaw_deg: np.ndarray,
+                         elevation_deg: np.ndarray, azimuth_deg: np.ndarray) -> np.ndarray:
+    """cos(AOI) between the tilted, rotating panel and the sun -- 0 where the
+    sun is behind the panel (no direct beam reaches it), never negative.
+
+    Where attitude is NaN (no /zeus/flight match for that sample), falls
+    back to cos(zenith) -- i.e. the flat-horizontal assumption -- rather
+    than propagating NaN into the theoretical-power calc for that row.
+    """
+    normal = panel_normal_ned(roll_deg, pitch_deg, yaw_deg)
+    sun = sun_direction_ned(elevation_deg, azimuth_deg)
+    cos_aoi = np.einsum("ij,ij->i", normal, sun)
+    cos_zenith_fallback = np.sin(np.radians(elevation_deg))  # cos(zenith) == sin(elevation)
+    cos_aoi = np.where(np.isnan(cos_aoi), cos_zenith_fallback, cos_aoi)
+    return np.clip(cos_aoi, 0.0, 1.0)
+
+
 # --------------------------------------------------------------------------
 # Main analysis
 # --------------------------------------------------------------------------
@@ -386,7 +516,7 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
         raise FileNotFoundError(f"ULog file not found: {ulog_path}")
 
     print(f"Loading {ulog_path.name} ...")
-    topics = [GPS_TOPIC, *MPPT_TOPICS, TEMP_TOPIC]
+    topics = [GPS_TOPIC, *MPPT_TOPICS, TEMP_TOPIC, FLIGHT_TOPIC]
     ulog = ULog(str(ulog_path), message_name_filter_list=topics)
 
     gps_df = load_gps(ulog)
@@ -415,6 +545,27 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
         ).set_index("time")
     else:
         merged["tout_c"] = np.nan
+
+    # Attach aircraft attitude, on the same MPPT-anchored timeline, for the
+    # panel incidence-angle correction (see cos_incidence_angle()). Skipped
+    # entirely under --assume-horizontal, matching the old flat-plate
+    # behavior without needing /zeus/flight in the log at all.
+    if not args.assume_horizontal:
+        attitude_df = load_attitude(ulog)
+        if attitude_df is not None:
+            tol_attitude = pd.Timedelta(seconds=args.attitude_tolerance_s)
+            merged = pd.merge_asof(
+                merged.reset_index(), attitude_df.reset_index(),
+                on="time", direction="nearest", tolerance=tol_attitude,
+            ).set_index("time")
+            n_missing_attitude = merged["roll_deg"].isna().sum()
+            if n_missing_attitude:
+                print(f"  WARNING: {n_missing_attitude} samples ({100 * n_missing_attitude / len(merged):.1f}%) "
+                      f"had no attitude match - falling back to a flat horizontal assumption for those rows.")
+        else:
+            merged["roll_deg"] = np.nan
+            merged["pitch_deg"] = np.nan
+            merged["yaw_deg"] = np.nan
 
     # Sanity-filter obviously-bad raw readings before they can reach the
     # printed summary, CSV, or plot -- not just the derate math. Seen in the
@@ -469,6 +620,21 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
     )
     merged = merged.join(irr)
 
+    # Plane-of-array irradiance: the panel isn't flat/horizontal (see
+    # PANEL_NORMAL_BODY), so project the direct beam onto the actual,
+    # rotating panel normal instead of assuming it always faces straight up.
+    # ghi_w_m2 (flat-plate) is kept as-is for comparison; poa_w_m2 is what
+    # actually drives pv_power_theoretical_bare_w below, unless
+    # --assume-horizontal was passed (in which case poa_w_m2 == ghi_w_m2).
+    if args.assume_horizontal:
+        merged["poa_w_m2"] = merged["ghi_w_m2"]
+    else:
+        cos_aoi = cos_incidence_angle(
+            merged["roll_deg"].values, merged["pitch_deg"].values, merged["yaw_deg"].values,
+            merged["sun_elevation_deg"].values, merged["sun_azimuth_deg"].values,
+        )
+        merged["poa_w_m2"] = merged["dni_w_m2"] * cos_aoi
+
     # Optional temperature derating: factor = 1 + coeff%/degC * (Tout - STC_TEMP_C).
     # coeff is negative, so Tout ABOVE STC_TEMP_C (25 degC) is a LOSS
     # (factor < 1) but Tout BELOW STC_TEMP_C is a GAIN (factor > 1) -- this
@@ -498,7 +664,7 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
     # (already-applied) encapsulation loss -- when derating is off, nominal
     # IS the final theoretical number.
     total_area_m2 = args.cell_count * args.cell_area_cm2 / 1e4
-    bare_w = merged["ghi_w_m2"] * total_area_m2 * args.cell_efficiency
+    bare_w = merged["poa_w_m2"] * total_area_m2 * args.cell_efficiency
     merged["pv_power_theoretical_bare_w"] = bare_w
     encapsulation_transmission = args.etfe_transmission * args.poe_transmission
     nominal_w = bare_w * encapsulation_transmission
@@ -550,7 +716,18 @@ def print_summary(df: pd.DataFrame, args: argparse.Namespace, tz: str) -> None:
           f"(always applied -- see docstring)")
     print(f"STC-rated array power    : {rated_stc_w:.1f} W  (at 1000 W/m^2, 25 degC, bare cells)")
     print(f"Peak measured PV power   : {df['pv_power_actual_w'].max():.1f} W")
-    print(f"Peak modeled GHI         : {df['ghi_w_m2'].max():.1f} W/m^2")
+    print(f"Peak modeled GHI (flat)  : {df['ghi_w_m2'].max():.1f} W/m^2")
+    print(f"Peak modeled POA (tilted): {df['poa_w_m2'].max():.1f} W/m^2")
+    if args.assume_horizontal:
+        print(f"Panel incidence angle    : disabled (--assume-horizontal) -- POA == GHI")
+    else:
+        # Positive change_pct = tilt GAIN vs flat (banked toward the sun),
+        # negative = LOSS (banked away) -- unlike temp derate this has no
+        # fixed sign bias, it depends entirely on this flight's maneuvering.
+        tilt_valid = df["ghi_w_m2"] > 1.0
+        change_pct = 100.0 * (df.loc[tilt_valid, "poa_w_m2"] / df.loc[tilt_valid, "ghi_w_m2"] - 1.0)
+        print(f"Panel incidence angle    : mean {change_pct.mean():+.1f}% vs flat-plate GHI  "
+              f"(range [{change_pct.min():+.1f}%, {change_pct.max():+.1f}%], roll/pitch/yaw applied)")
     print(f"Peak sun elevation       : {df['sun_elevation_deg'].max():.1f} deg")
     if "tout_c" in df.columns and df["tout_c"].notna().any():
         print(f"Fuselage skin temp (Tout proxy): mean {df['tout_c'].mean():.1f} degC  "
@@ -599,10 +776,13 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
         ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.06, 1.0), borderaxespad=0.0)
 
     ax = axes[0]
-    ax.plot(df.index, df["ghi_w_m2"], color="tab:orange", label="Modeled Clear-Sky GHI @ Lat/Lon/Alt")
+    ax.plot(df.index, df["ghi_w_m2"], color="tab:orange", alpha=0.6,
+            label="Modeled Clear-Sky GHI @ Lat/Lon/Alt (Flat, Horizontal)")
+    ax.plot(df.index, df["poa_w_m2"], color="tab:red",
+            label="Modeled POA Irradiance (Actual Panel Tilt)")
     ax2 = ax.twinx()
     ax2.plot(df.index, df["sun_elevation_deg"], color="tab:gray", alpha=0.6, label="Sun Elevation")
-    ax.set_ylabel("GHI: Global Horizontal Irradiance (W/m^2)")
+    ax.set_ylabel("Irradiance (W/m^2)")
     ax2.set_ylabel("Sun elevation (deg)")
     ax.set_title("Modeled Clear-Sky Irradiance Along the Flight Track", fontweight="bold")
     legend_outside(ax, ax2)
@@ -611,32 +791,17 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
 
     ax = axes[1]
     ax.plot(df.index, df["pv_power_actual_w"], color="tab:blue", label="Measured Pre-MPPT Power")
-    # Bare-cell ceiling (no ETFE, no temp derate) is always drawn as a thin
-    # reference line -- not physically real for this array, but it's the
-    # only way to see the ETFE cover's loss on the plot when temp derating
-    # is off (in that case "nominal"/"theoretical" below are the same curve).
-    ax.plot(df.index, df["pv_power_theoretical_bare_w"], color="tab:gray", linestyle=":",
-            alpha=0.6, label="Theoretical, No Temp Derate, Bare Cells")
+    # Bare-cell ceiling, the pre-temp-derate "No Temp Derate" curves, and the
+    # temp derate loss/gain shading are all computed and still exported to
+    # the CSV (pv_power_theoretical_bare_w / _nominal_w), but hidden from the
+    # plot itself (2026-08-25) to declutter it now that there are several
+    # theoretical tiers -- only the final Theoretical, Temp-Derated curve
+    # (which already has bare/ETFE/POE/tilt all baked in) is drawn against
+    # Measured. See print_summary()'s "Temp derate effect" line for the
+    # loss/gain magnitude instead of reading it off the plot.
     if has_derate:
-        ax.plot(df.index, df["pv_power_theoretical_nominal_w"], color="tab:green", linestyle="--",
-                alpha=0.6, label="Theoretical, No Temp Derate, Encapsulated")
         ax.plot(df.index, df["pv_power_theoretical_w"], color="tab:olive", linestyle="-.",
                 label="Theoretical, Temp-Derated")
-        # Tout above STC (25 degC) is a LOSS (derated < nominal); Tout below
-        # STC is a GAIN (derated > nominal) since the coefficient is
-        # negative -- shade/label each region distinctly rather than
-        # assuming it's always a loss. Only label a region if it actually
-        # occurs, so the legend doesn't show an entry with no matching area.
-        derated = df["pv_power_theoretical_w"]
-        nominal = df["pv_power_theoretical_nominal_w"]
-        is_loss = derated < nominal
-        is_gain = derated > nominal
-        ax.fill_between(df.index, derated, nominal, where=is_loss, interpolate=True,
-                         color="tab:red", alpha=0.15,
-                         label="Temp Derate Loss" if is_loss.any() else None)
-        ax.fill_between(df.index, derated, nominal, where=is_gain, interpolate=True,
-                         color="tab:cyan", alpha=0.15,
-                         label="Temp Derate Gain" if is_gain.any() else None)
     else:
         # pv_power_theoretical_w already has the ETFE loss baked in (see
         # analyze()), so it IS the "No Temp Derate, Encapsulated" tier here --
@@ -660,6 +825,56 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     else:
         ax.set_title("Environmentals", fontweight="bold")
         legend_outside(ax)
+
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
+    axes[-1].set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved plot -> {out_path}")
+
+
+def make_strings_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
+    """Per-MPPT-string voltage and current, one line per string with a
+    consistent color across both panels. Separate from make_plot()'s summed
+    pv_power_actual_w, which hides channel-specific behavior -- e.g. one
+    string sagging in voltage, or dropping out, while the total looks fine.
+
+    String IDs are discovered from the dataframe's own columns (pv_voltage_
+    v_<id>) rather than hardcoded, so this naturally adapts to however many
+    /zeus/mppt_* channels were actually present in this log (see load_mppt()
+    -- a missing channel is skipped there, not backfilled with a placeholder).
+    """
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    local_index = df.index.tz_convert(tz)
+    df = df.set_axis(local_index)
+
+    string_ids = sorted(
+        c[len("pv_voltage_v_"):] for c in df.columns if c.startswith("pv_voltage_v_")
+    )
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7.5), sharex=True)
+
+    def legend_outside(ax):
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+
+    ax = axes[0]
+    for i, sid in enumerate(string_ids):
+        ax.plot(df.index, df[f"pv_voltage_v_{sid}"], color=colors[i % len(colors)],
+                label=f"String {sid} Voltage")
+    ax.set_ylabel("Voltage (V)")
+    ax.set_title("Per-String PV Voltage", fontweight="bold")
+    legend_outside(ax)
+
+    ax = axes[1]
+    for i, sid in enumerate(string_ids):
+        ax.plot(df.index, df[f"pv_current_a_{sid}"], color=colors[i % len(colors)],
+                label=f"String {sid} Current")
+    ax.set_ylabel("Current (A)")
+    ax.set_title("Per-String PV Current", fontweight="bold")
+    legend_outside(ax)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
     axes[-1].set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
@@ -719,10 +934,19 @@ def main() -> None:
     parser.add_argument("--temp-tolerance-s", type=float, default=1.0,
                          help="Max time gap allowed when matching a Tout (fuselage skin temp) "
                               "sample to an MPPT sample")
+    parser.add_argument("--attitude-tolerance-s", type=float, default=0.5,
+                         help="Max time gap allowed when matching a roll/pitch/yaw sample "
+                              "(/zeus/flight) to an MPPT sample")
     parser.add_argument("--apply-temp-derate", action="store_true",
                          help="Derate theoretical power using the datasheet's power temp "
                               "coefficient and the Tout proxy (fuselage skin temp). Off by "
                               "default -- see docstring for why this is opt-in.")
+    parser.add_argument("--assume-horizontal", action="store_true",
+                         help="Ignore aircraft attitude and assume the panel always faces "
+                              "straight up (the old behavior), instead of projecting irradiance "
+                              "onto the actual, rotating panel normal via /zeus/flight's "
+                              "roll/pitch/yaw. Panel incidence-angle correction is ON by "
+                              "default -- see docstring for why this is opt-OUT.")
     parser.add_argument("--output-dir", default=None,
                          help="Where to write the CSV/plot (default: alongside the ulog file)")
     parser.add_argument("--no-plot", action="store_true", help="Skip generating the PNG plot")
@@ -748,7 +972,8 @@ def main() -> None:
     csv_path = out_dir / f"{stem}_solar_efficiency.csv"
     export_cols = [
         "lat", "lon", "alt_msl_m", "sun_elevation_deg", "sun_azimuth_deg",
-        "ghi_w_m2", "dni_w_m2", "dhi_w_m2",
+        "ghi_w_m2", "dni_w_m2", "dhi_w_m2", "poa_w_m2",
+        *(["roll_deg", "pitch_deg", "yaw_deg"] if "roll_deg" in df.columns else []),
         *(["tout_c"] if "tout_c" in df.columns else []),
         *[c for c in df.columns if c.startswith("pv_")],
         *(["temp_derate_factor"] if "temp_derate_factor" in df.columns else []),
@@ -762,6 +987,11 @@ def main() -> None:
         make_plot(df, plot_path, tz)
         if not args.no_open:
             open_in_vscode(plot_path)
+
+        strings_plot_path = out_dir / f"{stem}_strings.png"
+        make_strings_plot(df, strings_plot_path, tz)
+        if not args.no_open:
+            open_in_vscode(strings_plot_path)
 
 
 if __name__ == "__main__":
