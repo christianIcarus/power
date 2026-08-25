@@ -81,6 +81,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -521,6 +523,34 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     print(f"Saved plot -> {out_path}")
 
 
+def open_in_vscode(path: Path) -> None:
+    """Open the generated plot in VS Code, reusing the existing window.
+
+    `-r`/`--reuse-window` targets the already-open VS Code window instead of
+    spawning a new one; re-running the script therefore just refreshes the
+    same image tab rather than piling up new windows each time. Best-effort:
+    if the `code` CLI isn't on PATH (e.g. not installed, or "Shell Command:
+    Install 'code' command" was never run) or the call otherwise fails, this
+    prints a note instead of failing the whole analysis run.
+    """
+    # Resolve to the actual code(.CMD) path rather than passing the bare
+    # "code" string to subprocess: on Windows the launcher is a .CMD shim,
+    # and CreateProcess (which subprocess uses without shell=True) won't
+    # apply PATHEXT resolution to find it the way a shell would -- so the
+    # unresolved name raises "WinError 2: The system cannot find the file
+    # specified" even though shutil.which() locates it just fine.
+    code_cmd = shutil.which("code")
+    if code_cmd is None:
+        print("  (note: 'code' CLI not found on PATH - skipping VS Code auto-open. "
+              "Run \"Shell Command: Install 'code' command in PATH\" from VS Code's "
+              "command palette to enable this.)")
+        return
+    try:
+        subprocess.run([code_cmd, "-r", str(path)], check=True)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        print(f"  (note: could not auto-open {path.name} in VS Code: {exc})")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ulog", default=DEFAULT_ULOG, help="Path to the PX4 .ulg flight log")
@@ -542,6 +572,9 @@ def main() -> None:
     parser.add_argument("--output-dir", default=None,
                          help="Where to write the CSV/plot (default: alongside the ulog file)")
     parser.add_argument("--no-plot", action="store_true", help="Skip generating the PNG plot")
+    parser.add_argument("--no-open", action="store_true",
+                         help="Don't auto-open the generated plot in VS Code after saving it "
+                              "(on by default; requires the 'code' CLI on PATH)")
     parser.add_argument("--tz", default=None,
                          help="Timezone for the plot's time axis (IANA name, e.g. America/Los_Angeles). "
                               "Default: auto-detected from the launch-site GPS fix. "
@@ -571,7 +604,10 @@ def main() -> None:
     print(f"Saved data -> {csv_path}")
 
     if not args.no_plot:
-        make_plot(df, out_dir / f"{stem}_solar_efficiency.png", tz)
+        plot_path = out_dir / f"{stem}_solar_efficiency.png"
+        make_plot(df, plot_path, tz)
+        if not args.no_open:
+            open_in_vscode(plot_path)
 
 
 if __name__ == "__main__":
