@@ -289,6 +289,25 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
     else:
         merged["tout_c"] = np.nan
 
+    # Sanity-filter obviously-bad raw readings before they can reach the
+    # printed summary, CSV, or plot -- not just the derate math. Seen in the
+    # wild: a hard sentinel of exactly -273.15 degC (0 Kelvin), presumably an
+    # uninitialized/fault value from the sensor or its logging path. Anything
+    # outside the generous TOUT_CLAMP_RANGE_C envelope is treated as missing
+    # (not as a real extreme reading) and forward-filled below like any other
+    # gap. Runs unconditionally, regardless of --apply-temp-derate, since a
+    # sentinel like this corrupts what's *displayed*, not just the derating.
+    raw_tout = merged["tout_c"]
+    is_bad_tout = raw_tout.notna() & (
+        (raw_tout < TOUT_CLAMP_RANGE_C[0]) | (raw_tout > TOUT_CLAMP_RANGE_C[1])
+    )
+    n_bad_tout = int(is_bad_tout.sum())
+    if n_bad_tout:
+        print(f"  WARNING: {n_bad_tout} Tout readings ({100 * n_bad_tout / len(merged):.1f}%) fell "
+              f"outside the plausible {TOUT_CLAMP_RANGE_C} degC envelope (e.g. a dead/fault "
+              f"sentinel) - treated as missing and forward-filled, not plotted/derated as-read.")
+        merged.loc[is_bad_tout, "tout_c"] = np.nan
+
     # Tout is slow-moving (whole-flight range is typically only a few degC),
     # so forward-filling brief match gaps introduces negligible error. Rows
     # with no match at all (before the first sample, or topic missing) stay
@@ -327,17 +346,14 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
     # coeff is negative, so Tout ABOVE STC_TEMP_C (25 degC) is a LOSS
     # (factor < 1) but Tout BELOW STC_TEMP_C is a GAIN (factor > 1) -- this
     # is not just a loss term, and downstream code/plots must not assume it
-    # always reduces power. Input temp is clamped defensively (e.g. against
-    # a future dead-sentinel reading) before computing the factor -- see
-    # TOUT_CLAMP_RANGE_C -- and the resulting factor itself is floored at 0
+    # always reduces power. Sentinel/out-of-envelope raw readings are already
+    # scrubbed to NaN-then-ffilled above (so they can't reach here at all);
+    # the clip below is just a final defensive no-op in case that upstream
+    # sanitation is ever skipped, and the resulting factor is floored at 0
     # (power can shrink toward zero in a pathological case, but never go
-    # negative) as a final backstop.
+    # negative) as a last backstop.
     if args.apply_temp_derate:
         tout_clamped = merged["tout_c"].clip(*TOUT_CLAMP_RANGE_C)
-        n_clamped = (merged["tout_c"] != tout_clamped).sum()
-        if n_clamped:
-            print(f"  WARNING: {n_clamped} Tout readings fell outside "
-                  f"{TOUT_CLAMP_RANGE_C} degC and were clamped before derating.")
         merged["temp_derate_factor"] = (
             1.0 + (POWER_TEMP_COEFF_PCT_PER_C / 100.0) * (tout_clamped - STC_TEMP_C)
         )
