@@ -176,6 +176,7 @@ from timezonefinder import TimezoneFinder
 # --------------------------------------------------------------------------
 DEFAULT_ULOG = r"C:\Users\ChristianHammerly\Downloads\2026_08_10_SN30solarRT.ulg"
 DEFAULT_CELL_COUNT = 72
+DEFAULT_STRING1_CELL_COUNT = 58       # of the 72 total -- string 1 is NOT half the array (user, 2026-08-25)
 DEFAULT_CELL_AREA_CM2 = 155.0        # per cell
 DEFAULT_CELL_EFFICIENCY = 0.254      # 25.4%, typical Pe/Oe bin boundary
 POWER_TEMP_COEFF_PCT_PER_C = -0.27   # informational, not applied by default
@@ -528,6 +529,114 @@ def cos_incidence_angle(roll_deg: np.ndarray, pitch_deg: np.ndarray, yaw_deg: np
 
 
 # --------------------------------------------------------------------------
+# Flight phase (for plot markers -- holding high/low altitude, descending)
+# --------------------------------------------------------------------------
+FLIGHT_PHASE_RATE_THRESHOLD_M_S = 0.5   # |vertical rate| at/below this counts as "holding"
+FLIGHT_PHASE_SMOOTHING_S = 60.0         # trailing time window for the rate, not a row count
+
+
+def classify_flight_phase(altitude_m: pd.Series) -> pd.Series:
+    """Per-sample flight phase from the altitude time series alone: one of
+    "climbing", "holding_high", "descending", "holding_low".
+
+    Vertical rate is a TIME-based trailing rolling mean (pandas' '60s'
+    window, not a fixed row count), since GPS altitude noise makes a raw
+    sample-to-sample diff flap sign constantly, and this timeline's sample
+    spacing isn't uniform. "High" vs "low" for a holding period is relative
+    to THIS flight's own midpoint altitude ((min+max)/2), not an absolute
+    threshold -- works whether the flight ceiling is 2 km or 20 km. Only
+    "holding_high"/"descending"/"holding_low" are meant to be shown on
+    plots (see shade_flight_phases()); "climbing" -- e.g. the initial
+    climb-out -- is left as the unmarked default.
+    """
+    dt_s = altitude_m.index.to_series().diff().dt.total_seconds()
+    rate_m_s = altitude_m.diff() / dt_s
+    rate_smooth = rate_m_s.rolling(f"{FLIGHT_PHASE_SMOOTHING_S:.0f}s", min_periods=1).mean()
+
+    mid_alt_m = (altitude_m.min() + altitude_m.max()) / 2.0
+    is_holding = rate_smooth.abs() <= FLIGHT_PHASE_RATE_THRESHOLD_M_S
+    conditions = [
+        rate_smooth < -FLIGHT_PHASE_RATE_THRESHOLD_M_S,
+        is_holding & (altitude_m >= mid_alt_m),
+        is_holding & (altitude_m < mid_alt_m),
+    ]
+    choices = ["descending", "holding_high", "holding_low"]
+    return pd.Series(np.select(conditions, choices, default="climbing"), index=altitude_m.index)
+
+
+# Phase -> (background color, legend label). Only these three are drawn --
+# "climbing" has no entry and is left unmarked (see classify_flight_phase()).
+FLIGHT_PHASE_STYLE = {
+    "holding_high": ("gold", "Holding High Altitude"),
+    "descending": ("lightsteelblue", "Descending"),
+    "holding_low": ("darkseagreen", "Holding Low Altitude"),
+}
+
+
+def shade_flight_phases(axes, phase: pd.Series) -> None:
+    """Shade holding-high/descending/holding-low segments as low-zorder
+    background spans on every axis in `axes`, so any time-series plot can
+    show which flight phase each moment falls in. Draws on each axis
+    independently (rather than sharing one span object) so each panel's own
+    legend -- built separately per panel via legend_outside() -- picks up
+    exactly one labeled handle per phase actually present, in that panel's
+    own draw order.
+    """
+    change = phase.ne(phase.shift()).cumsum()
+    seen_per_axis = {id(ax): set() for ax in axes}
+    for _, seg in phase.groupby(change):
+        name = seg.iloc[0]
+        if name not in FLIGHT_PHASE_STYLE:
+            continue
+        color, label = FLIGHT_PHASE_STYLE[name]
+        start, end = seg.index[0], seg.index[-1]
+        for ax in axes:
+            seen = seen_per_axis[id(ax)]
+            ax.axvspan(start, end, color=color, alpha=0.12, zorder=0,
+                       label=label if name not in seen else None)
+            seen.add(name)
+
+
+def main_hold_window(phase: pd.Series):
+    """(zone1_start, zone3_end): the start of the LONGEST holding_high
+    segment through the end of the LONGEST holding_low segment that starts
+    after it -- i.e. the main climb-hold / descend / hold-low sequence
+    ("zones 1-3"), not a brief pre-takeoff hold or a flickery landing-
+    approach hold (both also classified holding_low, but much shorter).
+    Picking the longest of each type, rather than the first/last, is what
+    tells those apart. Returns (start, None) if no holding_low follows the
+    main hold, or None entirely if there's no holding_high at all.
+    """
+    change = phase.ne(phase.shift()).cumsum()
+    segments = [(seg.iloc[0], seg.index[0], seg.index[-1]) for _, seg in phase.groupby(change)]
+    highs = [s for s in segments if s[0] == "holding_high"]
+    if not highs:
+        return None
+    zone1_start = max(highs, key=lambda s: s[2] - s[1])[1]
+    lows_after = [s for s in segments if s[0] == "holding_low" and s[1] > zone1_start]
+    zone3_end = max(lows_after, key=lambda s: s[2] - s[1])[2] if lows_after else None
+    return zone1_start, zone3_end
+
+
+def keep_main_hold(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep ONLY zones 1-3 -- the main holding_high / descending /
+    holding_low sequence, start to end (see main_hold_window()) -- dropping
+    everything before zone 1 (climb-out) and after zone 3 (final approach/
+    landing, which includes flickery descending/holding_low blips that
+    share a phase label with zones 2/3 but aren't part of that contiguous
+    run). One contiguous real-time slice, so no seam or re-indexing is
+    needed -- the real clock-time index is kept as-is.
+    """
+    window = main_hold_window(df["flight_phase"])
+    if window is None:
+        return df
+    zone1_start, zone3_end = window
+    if zone3_end is None:
+        return df[df.index >= zone1_start]
+    return df[(df.index >= zone1_start) & (df.index <= zone3_end)]
+
+
+# --------------------------------------------------------------------------
 # Main analysis
 # --------------------------------------------------------------------------
 def analyze(args: argparse.Namespace) -> pd.DataFrame:
@@ -713,6 +822,38 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
         100.0 * merged.loc[valid, "pv_power_actual_w"] / merged.loc[valid, "pv_power_estimated_w"]
     )
 
+    # Same three-tier estimate, restricted to MPPT string 1 alone: its own
+    # POA (PANEL_NORMAL_BODY_STRING_1) and its own cell count
+    # (--string1-cell-count -- NOT half of --cell-count; the two strings
+    # aren't equal size). Encapsulation and temp-derate factors are reused
+    # as-is since the ETFE/POE cover and Tout apply array-wide, not per
+    # string. Only computed if this log actually has a string-1 channel;
+    # feeds make_string1_plot() only, not the array-wide summary above.
+    if "pv_power_w_1" in merged.columns:
+        area_string1_m2 = args.string1_cell_count * args.cell_area_cm2 / 1e4
+        bare_string1_w = merged["poa_string1_w_m2"] * area_string1_m2 * args.cell_efficiency
+        merged["pv_power_estimated_bare_string1_w"] = bare_string1_w
+        nominal_string1_w = bare_string1_w * encapsulation_transmission
+        if args.apply_temp_derate:
+            merged["pv_power_estimated_nominal_string1_w"] = nominal_string1_w
+            merged["pv_power_estimated_string1_w"] = nominal_string1_w * merged["temp_derate_factor"]
+        else:
+            merged["pv_power_estimated_string1_w"] = nominal_string1_w
+
+        valid_string1 = (merged["sun_elevation_deg"] > 0) & (merged["pv_power_estimated_string1_w"] > 1.0)
+        merged["pre_mppt_efficiency_string1_pct"] = np.nan
+        merged.loc[valid_string1, "pre_mppt_efficiency_string1_pct"] = (
+            100.0 * merged.loc[valid_string1, "pv_power_w_1"]
+            / merged.loc[valid_string1, "pv_power_estimated_string1_w"]
+        )
+        merged.attrs["string1_area_m2"] = area_string1_m2
+
+    # Flight phase, for plot markers -- see classify_flight_phase()/
+    # shade_flight_phases(). Altitude-only, so this could run right after
+    # the GPS merge; kept here instead so it's next to everything else that
+    # only matters for the plots/CSV, not the efficiency calc itself.
+    merged["flight_phase"] = classify_flight_phase(merged["alt_msl_m"])
+
     merged.attrs["total_area_m2"] = total_area_m2
     merged.attrs["valid_mask"] = valid
     return merged
@@ -874,6 +1015,92 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     print(f"Saved plot -> {out_path}")
 
 
+def make_string1_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
+    """The same environmentals/irradiance/power/efficiency workflow as
+    make_plot(), applied to MPPT string 1 alone instead of the whole array:
+    its own POA (poa_string1_w_m2, PANEL_NORMAL_BODY_STRING_1), its own
+    measured channel (pv_power_w_1), and its own cell count
+    (--string1-cell-count). Environmentals (altitude/Tout) isn't actually
+    string-specific -- it's array-wide, same as in make_plot() -- but is
+    repeated here so this plot stands alone. Only the final estimated tier
+    is drawn against measured, matching make_plot()'s decluttered convention.
+
+    Only covers "zones 1-3" -- the main holding_high / descending /
+    holding_low sequence (see main_hold_window()) -- dropping the climb-out
+    before it and the final approach/landing after it. One contiguous
+    real-time slice (see keep_main_hold()), so the x-axis is plain real
+    clock time throughout, same as make_plot().
+    """
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    local_index = df.index.tz_convert(tz)
+    df = df.set_axis(local_index)
+    df = keep_main_hold(df)
+
+    has_tout = "tout_c" in df.columns and df["tout_c"].notna().any()
+    fig, axes = plt.subplots(4, 1, figsize=(12, 13.5), sharex=True)
+    # Flight-phase shading only goes on the Efficiency panel (axes[3]) here,
+    # not Environmentals/Irradiance/Power -- see the call just before that
+    # panel's plotting below.
+
+    def legend_outside(ax, *extra_axes):
+        handles, labels = ax.get_legend_handles_labels()
+        for extra in extra_axes:
+            h, l = extra.get_legend_handles_labels()
+            handles += h
+            labels += l
+        ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.06, 1.0), borderaxespad=0.0)
+
+    ax = axes[0]
+    ax.plot(df.index, df["alt_msl_m"], color="tab:purple", label="Altitude (MSL)")
+    ax.set_ylabel("Altitude MSL (m)")
+    if has_tout:
+        ax2 = ax.twinx()
+        ax2.plot(df.index, df["tout_c"], color="tab:brown", label="Fuselage Skin Temp (Tout Proxy)")
+        ax2.axhline(STC_TEMP_C, color="black", linewidth=0.8, linestyle=":", label=f"STC ({STC_TEMP_C:.0f} degC)")
+        ax2.set_ylabel("Temp (degC)")
+        ax.set_title("Environmentals", fontweight="bold")
+        legend_outside(ax, ax2)
+    else:
+        ax.set_title("Environmentals", fontweight="bold")
+        legend_outside(ax)
+
+    ax = axes[1]
+    ax.plot(df.index, df["ghi_w_m2"], color="tab:orange", alpha=0.6,
+            label="Modeled Clear-Sky GHI @ Lat/Lon/Alt (Flat, Horizontal)")
+    ax.plot(df.index, df["poa_string1_w_m2"], color="tab:red", label="String 1 POA Irradiance")
+    ax2 = ax.twinx()
+    ax2.plot(df.index, df["sun_elevation_deg"], color="tab:gray", alpha=0.6, label="Sun Elevation")
+    ax.set_ylabel("Irradiance (W/m^2)")
+    ax2.set_ylabel("Sun elevation (deg)")
+    ax.set_title("String 1: Modeled Clear-Sky Irradiance", fontweight="bold")
+    legend_outside(ax, ax2)
+
+    ax = axes[2]
+    ax.plot(df.index, df["pv_power_w_1"], color="tab:blue", label="String 1 Measured Power")
+    ax.plot(df.index, df["pv_power_estimated_string1_w"], color="tab:olive", linestyle="-.",
+            label="String 1 Estimated Power")
+    ax.set_ylabel("Power (W)")
+    ax.set_title("String 1: Measured vs. Estimated Power", fontweight="bold")
+    legend_outside(ax)
+
+    ax = axes[3]
+    shade_flight_phases([ax], df["flight_phase"])
+    ax.plot(df.index, df["pre_mppt_efficiency_string1_pct"], color="tab:brown",
+            label="String 1 Measured / Estimated Power")
+    ax.axhline(100.0, color="black", linewidth=0.8, linestyle=":", label="100% (measured = estimated)")
+    ax.set_ylabel("Efficiency (%)")
+    ax.set_title("String 1: Measured / Estimated Power", fontweight="bold")
+    legend_outside(ax)
+
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
+    axes[-1].set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved plot -> {out_path}")
+
+
 def make_strings_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     """Per-MPPT-string voltage and current, one line per string with a
     consistent color across both panels. Separate from make_plot()'s summed
@@ -986,6 +1213,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ulog", default=DEFAULT_ULOG, help="Path to the PX4 .ulg flight log")
     parser.add_argument("--cell-count", type=int, default=DEFAULT_CELL_COUNT)
+    parser.add_argument("--string1-cell-count", type=int, default=DEFAULT_STRING1_CELL_COUNT,
+                         help="Cells wired into MPPT string 1 specifically (NOT half of "
+                              "--cell-count -- the two strings aren't necessarily equal size). "
+                              "Used only for the dedicated string-1 efficiency plot.")
     parser.add_argument("--cell-area-cm2", type=float, default=DEFAULT_CELL_AREA_CM2)
     parser.add_argument("--cell-efficiency", type=float, default=DEFAULT_CELL_EFFICIENCY,
                          help="Fractional cell efficiency, e.g. 0.254 for 25.4%%")
@@ -1042,13 +1273,14 @@ def main() -> None:
 
     csv_path = out_dir / f"{stem}_solar_efficiency.csv"
     export_cols = [
-        "lat", "lon", "alt_msl_m", "sun_elevation_deg", "sun_azimuth_deg",
+        "lat", "lon", "alt_msl_m", "flight_phase", "sun_elevation_deg", "sun_azimuth_deg",
         "ghi_w_m2", "dni_w_m2", "dhi_w_m2", "poa_w_m2", "poa_string0_w_m2", "poa_string1_w_m2",
         *(["roll_deg", "pitch_deg", "yaw_deg"] if "roll_deg" in df.columns else []),
         *(["tout_c"] if "tout_c" in df.columns else []),
         *[c for c in df.columns if c.startswith("pv_")],
         *(["temp_derate_factor"] if "temp_derate_factor" in df.columns else []),
         "pre_mppt_efficiency_pct",
+        *(["pre_mppt_efficiency_string1_pct"] if "pre_mppt_efficiency_string1_pct" in df.columns else []),
     ]
     df[export_cols].to_csv(csv_path)
     print(f"Saved data -> {csv_path}")
@@ -1068,6 +1300,14 @@ def main() -> None:
         make_poa_strings_plot(df, poa_strings_plot_path, tz)
         if not args.no_open:
             open_in_vscode(poa_strings_plot_path)
+
+        if "pv_power_w_1" in df.columns:
+            string1_plot_path = out_dir / f"{stem}_string1.png"
+            make_string1_plot(df, string1_plot_path, tz)
+            if not args.no_open:
+                open_in_vscode(string1_plot_path)
+        else:
+            print("  (note: no pv_power_w_1 in this log - skipping the string-1 plot)")
 
 
 if __name__ == "__main__":
