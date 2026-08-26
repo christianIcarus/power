@@ -1146,7 +1146,7 @@ def make_string1_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     legend_outside(ax)
 
     ax = axes[3]
-    plot_pct_diff_panel(ax, df)
+    plot_pct_diff_panel(ax, df, show_band=False)
     legend_outside(ax)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
@@ -1356,6 +1356,16 @@ def make_normal_sweep_plot(df: pd.DataFrame, sweep: pd.DataFrame, out_path: Path
     min_theta = valid.idxmin() if not valid.empty else None
     min_value = valid.min() if not valid.empty else None
 
+    # Value of the curve at the assumed angle itself (nearest grid point --
+    # assumed_theta generally doesn't land exactly on a sweep step), so the
+    # assumed normal's own scatter can be called out and compared numerically
+    # against the minimum, not just located on the x-axis via the vline.
+    nearest_pos = sweep.index.get_indexer([assumed_theta], method="nearest")[0]
+    assumed_grid_theta = sweep.index[nearest_pos]
+    assumed_value = sweep["mean_rolling_std"].iloc[nearest_pos]
+    if pd.isna(assumed_value):
+        assumed_value = None
+
     fig, (ax_ts, ax_sweep) = plt.subplots(2, 1, figsize=(11, 10))
 
     plot_pct_diff_panel(ax_ts, ts, show_band=True)
@@ -1365,16 +1375,27 @@ def make_normal_sweep_plot(df: pd.DataFrame, sweep: pd.DataFrame, out_path: Path
 
     ax_sweep.plot(sweep.index, sweep["mean_rolling_std"], color="tab:brown", marker=".", markersize=3)
     ax_sweep.axvline(assumed_theta, color="black", linewidth=0.8, linestyle="--",
-                      label=f"Assumed String 1 Normal ({assumed_theta:.2f} deg)")
+                      label="Assumed String 1 Normal")
+    # Both callouts lean only slightly off-vertical (small horizontal offset,
+    # large vertical one) -- a callout that leans hard to one side runs
+    # roughly parallel to the curve's own rising slope on that side and ends
+    # up grazing/crossing it (what a wider, shallower offset did before).
+    # Staying close to vertical keeps the arrow crossing the curve exactly
+    # once, right at its own point. The two points sit only ~1 deg apart, so
+    # leaning them away from each other (left/right) is what keeps the two
+    # labels from colliding with each other.
+    if assumed_value is not None:
+        ax_sweep.plot(assumed_grid_theta, assumed_value, marker="o", color="tab:blue", markersize=7,
+                       zorder=5, label="Assumed Normal Std")
+        ax_sweep.annotate(f"Assumed: {assumed_value:.2f}", xy=(assumed_grid_theta, assumed_value),
+                           xytext=(-15, 80), textcoords="offset points", ha="right",
+                           color="tab:blue", fontweight="bold",
+                           arrowprops=dict(arrowstyle="->", color="tab:blue", linewidth=1.0))
     if min_theta is not None:
         ax_sweep.plot(min_theta, min_value, marker="o", color="tab:red", markersize=7, zorder=5,
-                       label=f"Minimum ({min_theta:.2f} deg, {min_value:.2f})")
-        # Offset well clear of the marker and the curve's rising sides, with
-        # an arrow pointing back to the point -- putting the text directly
-        # on/above the marker (the old approach) crowded it right where the
-        # dip is narrowest.
+                       label="Minimum")
         ax_sweep.annotate(f"Min: {min_theta:.2f} deg", xy=(min_theta, min_value),
-                           xytext=(45, 40), textcoords="offset points", ha="left",
+                           xytext=(15, 95), textcoords="offset points", ha="left",
                            color="tab:red", fontweight="bold",
                            arrowprops=dict(arrowstyle="->", color="tab:red", linewidth=1.0))
     ax_sweep.set_xlabel("Assumed Panel-Normal Angle (deg): 0 = -X (nose), 90 = +Z (up), 180 = +X (tail)")
@@ -1518,8 +1539,8 @@ def main() -> None:
             if not args.no_open:
                 open_in_vscode(pct_diff_plot_path)
 
-            print("Sweeping String 1 panel-normal angle (75-125 deg, 0.05 deg steps) ...")
-            sweep = sweep_panel_normal_angle(df, args, angle_min_deg=75.0, angle_max_deg=125.0,
+            print("Sweeping String 1 panel-normal angle (90-105 deg, 0.05 deg steps) ...")
+            sweep = sweep_panel_normal_angle(df, args, angle_min_deg=90.0, angle_max_deg=105.0,
                                               angle_step_deg=0.05)
             sweep_plot_path = out_dir / f"{stem}_normal_sweep.png"
             make_normal_sweep_plot(df, sweep, sweep_plot_path, tz)
