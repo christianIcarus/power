@@ -538,6 +538,11 @@ def cos_incidence_angle(roll_deg: np.ndarray, pitch_deg: np.ndarray, yaw_deg: np
 FLIGHT_PHASE_RATE_THRESHOLD_M_S = 0.5   # |vertical rate| at/below this counts as "holding"
 FLIGHT_PHASE_SMOOTHING_S = 60.0         # trailing time window for the rate, not a row count
 
+# Rolling window for characterizing % Difference scatter (make_string1_plot).
+# Long enough to average out per-sample noise in the efficiency ratio, short
+# enough to still track real trend changes (e.g. cloud passage, altitude).
+PCT_DIFF_ROLLING_WINDOW_S = 300.0
+
 
 def classify_flight_phase(altitude_m: pd.Series) -> pd.Series:
     """Per-sample flight phase from the altitude time series alone: one of
@@ -1019,6 +1024,30 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     print(f"Saved plot -> {out_path}")
 
 
+def rolling_robust_band(series: pd.Series, window_s: float):
+    """Rolling median +/- a rolling robust standard deviation (MAD * 1.4826).
+
+    Deliberately NOT a rolling mean +/- rolling std: this series (% Difference,
+    measured vs. estimated) inherits the model's known heavy-tailed spikes --
+    see the "efficiency is measured against modeled CLEAR-SKY GHI" caveat in
+    print_summary() -- where the zero-diffuse-irradiance simplification blows
+    up at low sun elevation / high angle-of-incidence-mismatch, producing rare
+    spikes of several hundred percent. A plain std would be dominated by those
+    few spikes and overstate the day's typical scatter; median + MAD (scaled
+    by 1.4826, the constant that makes MAD comparable to std under
+    near-Gaussian noise) tracks the typical spread instead. Both stats use
+    pandas' built-in rolling median, which is vectorized -- no .apply().
+
+    Returns (center, half_width) so callers can plot center as a line and
+    (center - half_width, center + half_width) as a shaded band.
+    """
+    window = f"{window_s:.0f}s"
+    center = series.rolling(window, min_periods=1).median()
+    mad = (series - center).abs().rolling(window, min_periods=1).median()
+    half_width = mad * 1.4826
+    return center, half_width
+
+
 def make_string1_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     """The same environmentals/irradiance/power/efficiency workflow as
     make_plot(), applied to MPPT string 1 alone instead of the whole array:
@@ -1095,7 +1124,15 @@ def make_string1_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     # raw ratio -- 0% = measured matches estimated, +/- reads directly as
     # over/under, rather than needing to mentally subtract 100 each time.
     pct_diff = df["pre_mppt_efficiency_string1_pct"] - 100.0
-    ax.plot(df.index, pct_diff, color="tab:brown", label="String 1 % Difference (Measured vs. Estimated)")
+    window_min = PCT_DIFF_ROLLING_WINDOW_S / 60.0
+    center, half_width = rolling_robust_band(pct_diff, PCT_DIFF_ROLLING_WINDOW_S)
+    ax.fill_between(df.index, center - half_width, center + half_width,
+                     color="tab:brown", alpha=0.15, zorder=1,
+                     label=f"{window_min:.0f}-min Rolling Robust Std (MAD)")
+    ax.plot(df.index, pct_diff, color="tab:brown", alpha=0.5, linewidth=0.8,
+            label="String 1 % Difference (Measured vs. Estimated)")
+    ax.plot(df.index, center, color="black", linewidth=1.2,
+            label=f"{window_min:.0f}-min Rolling Median")
     ax.axhline(0.0, color="black", linewidth=0.8, linestyle=":", label="0% (measured = estimated)")
     ax.set_ylabel("% Difference")
     ax.set_title("String 1: % Difference, Measured vs. Estimated Power", fontweight="bold")
