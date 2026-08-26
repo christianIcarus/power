@@ -1036,6 +1036,36 @@ def rolling_band(series: pd.Series, window_s: float):
     return center, half_width
 
 
+def plot_pct_diff_panel(ax, df: pd.DataFrame) -> None:
+    """Draws the String 1 % Difference (measured vs. estimated) panel --
+    flight-phase shading, rolling mean/std band, raw trace, 0% reference --
+    onto `ax`. Factored out of make_string1_plot() so make_string1_plot()
+    (as its bottom panel) and make_string1_pct_diff_plot() (as its own
+    standalone figure) render identically instead of drifting apart.
+
+    Does not add a legend -- callers place that differently (inside vs.
+    outside the axes, extra handles or not), so each calls its own
+    ax.legend(...)/legend_outside(...) afterward.
+    """
+    shade_flight_phases([ax], df["flight_phase"])
+    # % difference from estimated (measured/estimated - 1) x 100, not the
+    # raw ratio -- 0% = measured matches estimated, +/- reads directly as
+    # over/under, rather than needing to mentally subtract 100 each time.
+    pct_diff = df["pre_mppt_efficiency_string1_pct"] - 100.0
+    window_min = PCT_DIFF_ROLLING_WINDOW_S / 60.0
+    center, half_width = rolling_band(pct_diff, PCT_DIFF_ROLLING_WINDOW_S)
+    ax.fill_between(df.index, center - half_width, center + half_width,
+                     color="tab:brown", alpha=0.15, zorder=1,
+                     label=f"{window_min:.0f}-min Rolling Std")
+    ax.plot(df.index, pct_diff, color="tab:brown", alpha=0.5, linewidth=0.8,
+            label="String 1 % Difference (Measured vs. Estimated)")
+    ax.plot(df.index, center, color="black", linewidth=1.2,
+            label=f"{window_min:.0f}-min Rolling Mean")
+    ax.axhline(0.0, color="black", linewidth=0.8, linestyle=":", label="0% (measured = estimated)")
+    ax.set_ylabel("% Difference")
+    ax.set_title("String 1: % Difference, Measured vs. Estimated Power", fontweight="bold")
+
+
 def make_string1_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     """The same environmentals/irradiance/power/efficiency workflow as
     make_plot(), applied to MPPT string 1 alone instead of the whole array:
@@ -1107,27 +1137,35 @@ def make_string1_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     legend_outside(ax)
 
     ax = axes[3]
-    shade_flight_phases([ax], df["flight_phase"])
-    # % difference from estimated (measured/estimated - 1) x 100, not the
-    # raw ratio -- 0% = measured matches estimated, +/- reads directly as
-    # over/under, rather than needing to mentally subtract 100 each time.
-    pct_diff = df["pre_mppt_efficiency_string1_pct"] - 100.0
-    window_min = PCT_DIFF_ROLLING_WINDOW_S / 60.0
-    center, half_width = rolling_band(pct_diff, PCT_DIFF_ROLLING_WINDOW_S)
-    ax.fill_between(df.index, center - half_width, center + half_width,
-                     color="tab:brown", alpha=0.15, zorder=1,
-                     label=f"{window_min:.0f}-min Rolling Std")
-    ax.plot(df.index, pct_diff, color="tab:brown", alpha=0.5, linewidth=0.8,
-            label="String 1 % Difference (Measured vs. Estimated)")
-    ax.plot(df.index, center, color="black", linewidth=1.2,
-            label=f"{window_min:.0f}-min Rolling Mean")
-    ax.axhline(0.0, color="black", linewidth=0.8, linestyle=":", label="0% (measured = estimated)")
-    ax.set_ylabel("% Difference")
-    ax.set_title("String 1: % Difference, Measured vs. Estimated Power", fontweight="bold")
+    plot_pct_diff_panel(ax, df)
     legend_outside(ax)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
     axes[-1].set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved plot -> {out_path}")
+
+
+def make_string1_pct_diff_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
+    """Standalone copy of make_string1_plot()'s bottom panel -- % Difference
+    (measured vs. estimated), String 1 -- as its own single-panel figure.
+    Same data, same "zones 1-3" window (keep_main_hold()), same rolling
+    band (plot_pct_diff_panel()) as the full 4-panel plot; this just lets
+    that one panel be viewed/shared on its own.
+    """
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    local_index = df.index.tz_convert(tz)
+    df = df.set_axis(local_index)
+    df = keep_main_hold(df)
+
+    fig, ax = plt.subplots(figsize=(12, 4.5))
+    plot_pct_diff_panel(ax, df)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
+    ax.set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved plot -> {out_path}")
@@ -1341,8 +1379,13 @@ def main() -> None:
             make_string1_plot(df, string1_plot_path, tz)
             if not args.no_open:
                 open_in_vscode(string1_plot_path)
+
+            pct_diff_plot_path = out_dir / f"{stem}_string1_pct_diff.png"
+            make_string1_pct_diff_plot(df, pct_diff_plot_path, tz)
+            if not args.no_open:
+                open_in_vscode(pct_diff_plot_path)
         else:
-            print("  (note: no pv_power_w_1 in this log - skipping the string-1 plot)")
+            print("  (note: no pv_power_w_1 in this log - skipping the string-1 plots)")
 
 
 if __name__ == "__main__":
