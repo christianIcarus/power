@@ -541,7 +541,7 @@ FLIGHT_PHASE_SMOOTHING_S = 60.0         # trailing time window for the rate, not
 # Rolling window for characterizing % Difference scatter (make_string1_plot).
 # Long enough to average out per-sample noise in the efficiency ratio, short
 # enough to still track real trend changes (e.g. cloud passage, altitude).
-PCT_DIFF_ROLLING_WINDOW_S = 600.0
+PCT_DIFF_ROLLING_WINDOW_S = 900.0
 
 
 def classify_flight_phase(altitude_m: pd.Series) -> pd.Series:
