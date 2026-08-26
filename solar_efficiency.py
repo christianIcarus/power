@@ -183,6 +183,10 @@ POWER_TEMP_COEFF_PCT_PER_C = -0.27   # informational, not applied by default
 STC_TEMP_C = 25.0
 STC_IRRADIANCE_W_M2 = 1000.0
 
+# Genasun MPPT-12SBB datasheet input voltage window.
+MPPT_12SBB_VIN_MIN_V = 8.0
+MPPT_12SBB_VIN_MAX_V = 51.0
+
 # Beer-Lambert sea-level zenith transmittance: broadband atmospheric
 # transmittance looking straight up through the WHOLE atmosphere, at sea
 # level, sun directly overhead. Value and model both borrowed from
@@ -1135,6 +1139,9 @@ def make_strings_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     for i, sid in enumerate(string_ids):
         ax.plot(df.index, df[f"pv_voltage_v_{sid}"], color=colors[i % len(colors)],
                 label=f"String {sid} Voltage")
+    ax.axhline(MPPT_12SBB_VIN_MIN_V, color="black", linewidth=0.8, linestyle="--",
+               label=f"MPPT-12SBB Input Range ({MPPT_12SBB_VIN_MIN_V:.0f}-{MPPT_12SBB_VIN_MAX_V:.0f}V)")
+    ax.axhline(MPPT_12SBB_VIN_MAX_V, color="black", linewidth=0.8, linestyle="--")
     ax.set_ylabel("Voltage (V)")
     ax.set_title("Per-String PV Voltage", fontweight="bold")
     legend_outside(ax)
