@@ -239,7 +239,11 @@ GPS_TOPIC = "vehicle_gps_position"
 MPPT_TOPICS = ("/zeus/mppt_0", "/zeus/mppt_1")
 TEMP_TOPIC = "/zeus/temperature"
 TEMP_FIELD = "tc_fuselage_outside_temp_c"          # Tout proxy -- see docstring caveat
-TOUT_CLAMP_RANGE_C = (-40.0, 85.0)                 # defensive: generous aviation/electronics envelope
+TOUT_CLAMP_RANGE_C = (-100.0, 85.0)                # defensive: generous aviation/electronics envelope --
+                                                    # floor wide enough to cover genuine stratospheric
+                                                    # cruise temps (this aircraft flies ~55-60kft, where
+                                                    # ISA predicts well below -40 degC) without catching
+                                                    # real readings as the dead-sensor sentinel
 FLIGHT_TOPIC = "/zeus/flight"                      # roll_deg/pitch_deg/yaw_deg -- see load_attitude()
 
 # Solar panel surface normals, in the aircraft's PX4 FRD body frame (+X
