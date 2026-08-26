@@ -1087,11 +1087,14 @@ def make_string1_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
 
     ax = axes[3]
     shade_flight_phases([ax], df["flight_phase"])
-    ax.plot(df.index, df["pre_mppt_efficiency_string1_pct"], color="tab:brown",
-            label="String 1 Measured / Estimated Power")
-    ax.axhline(100.0, color="black", linewidth=0.8, linestyle=":", label="100% (measured = estimated)")
-    ax.set_ylabel("Efficiency (%)")
-    ax.set_title("String 1: Measured / Estimated Power", fontweight="bold")
+    # % difference from estimated (measured/estimated - 1) x 100, not the
+    # raw ratio -- 0% = measured matches estimated, +/- reads directly as
+    # over/under, rather than needing to mentally subtract 100 each time.
+    pct_diff = df["pre_mppt_efficiency_string1_pct"] - 100.0
+    ax.plot(df.index, pct_diff, color="tab:brown", label="String 1 % Difference (Measured vs. Estimated)")
+    ax.axhline(0.0, color="black", linewidth=0.8, linestyle=":", label="0% (measured = estimated)")
+    ax.set_ylabel("% Difference")
+    ax.set_title("String 1: % Difference, Measured vs. Estimated Power", fontweight="bold")
     legend_outside(ax)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
