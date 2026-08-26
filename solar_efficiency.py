@@ -796,7 +796,7 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     df = df.set_axis(local_index)
 
     has_tout = "tout_c" in df.columns and df["tout_c"].notna().any()
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10.5), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(12, 13.5), sharex=True)
 
     def legend_outside(ax, *extra_axes):
         """Combine handles from ax + any twinx axes into one legend box
@@ -838,33 +838,17 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
 
     ax = axes[2]
     ax.plot(df.index, df["pv_power_actual_w"], color="tab:blue", label="Measured Pre-MPPT Power")
-    # Bare-cell ceiling (no ETFE, no POE, no temp derate) is always drawn as
-    # a thin reference line -- not physically real for this array, but it's
-    # the only way to see the encapsulation stack's loss on the plot when
-    # temp derating is off (in that case "nominal"/"estimated" below are
-    # the same curve).
-    ax.plot(df.index, df["pv_power_estimated_bare_w"], color="tab:gray", linestyle=":",
-            alpha=0.6, label="Estimated, No Temp Derate, Bare Cells")
+    # Bare-cell ceiling, the pre-temp-derate "No Temp Derate" curves, and the
+    # temp derate loss/gain shading are all computed and still exported to
+    # the CSV (pv_power_estimated_bare_w / _nominal_w), but hidden from the
+    # plot itself (2026-08-25) to declutter it now that there are several
+    # estimated tiers -- only the final Estimated, Temp-Derated curve (which
+    # already has bare/ETFE/POE/tilt all baked in) is drawn against
+    # Measured. See print_summary()'s "Temp derate effect" line for the
+    # loss/gain magnitude instead of reading it off the plot.
     if has_derate:
-        ax.plot(df.index, df["pv_power_estimated_nominal_w"], color="tab:green", linestyle="--",
-                alpha=0.6, label="Estimated, No Temp Derate, Encapsulated")
         ax.plot(df.index, df["pv_power_estimated_w"], color="tab:olive", linestyle="-.",
                 label="Estimated, Temp-Derated, Encapsulated")
-        # Tout above STC (25 degC) is a LOSS (derated < nominal); Tout below
-        # STC is a GAIN (derated > nominal) since the coefficient is
-        # negative -- shade/label each region distinctly rather than
-        # assuming it's always a loss. Only label a region if it actually
-        # occurs, so the legend doesn't show an entry with no matching area.
-        derated = df["pv_power_estimated_w"]
-        nominal = df["pv_power_estimated_nominal_w"]
-        is_loss = derated < nominal
-        is_gain = derated > nominal
-        ax.fill_between(df.index, derated, nominal, where=is_loss, interpolate=True,
-                         color="tab:red", alpha=0.15,
-                         label="Temp Derate Loss" if is_loss.any() else None)
-        ax.fill_between(df.index, derated, nominal, where=is_gain, interpolate=True,
-                         color="tab:cyan", alpha=0.15,
-                         label="Temp Derate Gain" if is_gain.any() else None)
     else:
         # pv_power_estimated_w already has the ETFE loss baked in (see
         # analyze()), so it IS the "No Temp Derate, Encapsulated" tier here --
@@ -873,6 +857,14 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
                 label="Estimated, No Temp Derate, Encapsulated")
     ax.set_ylabel("Power (W)")
     ax.set_title("Measured vs. Estimated Array Power", fontweight="bold")
+    legend_outside(ax)
+
+    ax = axes[3]
+    ax.plot(df.index, df["pre_mppt_efficiency_pct"], color="tab:brown",
+            label="Measured / Estimated Power")
+    ax.axhline(100.0, color="black", linewidth=0.8, linestyle=":", label="100% (measured = estimated)")
+    ax.set_ylabel("Efficiency (%)")
+    ax.set_title("Measured / Estimated Power", fontweight="bold")
     legend_outside(ax)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
