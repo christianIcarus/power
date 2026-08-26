@@ -1387,13 +1387,13 @@ def make_normal_sweep_plot(df: pd.DataFrame, sweep: pd.DataFrame, out_path: Path
     if assumed_value is not None:
         ax_sweep.plot(assumed_grid_theta, assumed_value, marker="o", color="tab:blue", markersize=7,
                        zorder=5, label="Assumed Normal Std")
-        ax_sweep.annotate(f"Assumed: {assumed_value:.2f}", xy=(assumed_grid_theta, assumed_value),
+        ax_sweep.annotate(f"Assumed: {assumed_theta:.2f} deg", xy=(assumed_grid_theta, assumed_value),
                            xytext=(-15, 80), textcoords="offset points", ha="right",
                            color="tab:blue", fontweight="bold",
                            arrowprops=dict(arrowstyle="->", color="tab:blue", linewidth=1.0))
     if min_theta is not None:
         ax_sweep.plot(min_theta, min_value, marker="o", color="tab:red", markersize=7, zorder=5,
-                       label="Minimum")
+                       label="Minimum Std")
         ax_sweep.annotate(f"Min: {min_theta:.2f} deg", xy=(min_theta, min_value),
                            xytext=(15, 95), textcoords="offset points", ha="left",
                            color="tab:red", fontweight="bold",
