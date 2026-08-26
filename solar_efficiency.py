@@ -1254,21 +1254,23 @@ def make_poa_strings_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     print(f"Saved plot -> {out_path}")
 
 
-def sweep_panel_normal_angle(df: pd.DataFrame, args, angle_step_deg: float = 1.0) -> pd.DataFrame:
+def sweep_panel_normal_angle(df: pd.DataFrame, args, angle_min_deg: float = 0.0,
+                              angle_max_deg: float = 180.0, angle_step_deg: float = 1.0) -> pd.DataFrame:
     """Sweep MPPT string 1's panel-normal unit vector through the aircraft's
     X-Z (longitudinal/vertical, CAD-frame) plane and recompute the % Difference
     rolling-std band at each angle -- a sensitivity check on the surveyed
     normal (PANEL_NORMAL_BODY_STRING_1), rather than a fixed assumption.
 
     Parameterized as x_cad(theta) = -cos(theta), z_cad(theta) = sin(theta),
-    which traces the unit circle through exactly the three points requested:
+    which traces the unit circle through:
         theta =   0 deg -> (x=-1, z= 0)  pointing toward the nose, flat
         theta =  90 deg -> (x= 0, z= 1)  straight up
         theta = 180 deg -> (x=+1, z= 0)  pointing toward the tail, flat
-    Each (x_cad, z_cad) is converted to a body-frame normal via
-    _panel_normal_body() -- the same CAD->body transform PANEL_NORMAL_BODY_
-    STRING_0/_1 themselves use -- so this sweeps the same kind of vector,
-    just varied instead of fixed.
+    (angle_min_deg/angle_max_deg need not span the full 0-180 -- e.g. a
+    narrow, fine-stepped range around a known minimum). Each (x_cad, z_cad)
+    is converted to a body-frame normal via _panel_normal_body() -- the same
+    CAD->body transform PANEL_NORMAL_BODY_STRING_0/_1 themselves use -- so
+    this sweeps the same kind of vector, just varied instead of fixed.
 
     Restricted to the same "zones 1-3" window as make_string1_plot() (see
     keep_main_hold()), and always applies the tilt correction regardless of
@@ -1294,7 +1296,7 @@ def sweep_panel_normal_angle(df: pd.DataFrame, args, angle_step_deg: float = 1.0
     area_string1_m2 = args.string1_cell_count * args.cell_area_cm2 / 1e4
     encapsulation_transmission = args.etfe_transmission * args.poe_transmission
 
-    angles = np.arange(0.0, 180.0 + angle_step_deg / 2.0, angle_step_deg)
+    angles = np.arange(angle_min_deg, angle_max_deg + angle_step_deg / 2.0, angle_step_deg)
     mean_rolling_std = []
     for theta_deg in angles:
         theta = np.radians(theta_deg)
@@ -1318,7 +1320,8 @@ def make_normal_sweep_plot(sweep: pd.DataFrame, out_path: Path) -> None:
     """Plots sweep_panel_normal_angle()'s result: mean % Difference rolling
     std vs. assumed panel-normal angle. A dip identifies the angle that
     minimizes measured-vs-estimated scatter; the surveyed String 1 normal
-    (PANEL_NORMAL_BODY_STRING_1) is marked for comparison against it.
+    (PANEL_NORMAL_BODY_STRING_1) and the sweep's own minimum are both marked
+    for comparison against each other.
     """
     import matplotlib.pyplot as plt
 
@@ -1330,10 +1333,20 @@ def make_normal_sweep_plot(sweep: pd.DataFrame, out_path: Path) -> None:
     nx, _, nz = PANEL_NORMAL_BODY_STRING_1
     reference_theta = np.degrees(np.arctan2(-nz, nx))
 
+    valid = sweep["mean_rolling_std"].dropna()
+    min_theta = valid.idxmin() if not valid.empty else None
+    min_value = valid.min() if not valid.empty else None
+
     fig, ax = plt.subplots(figsize=(9, 5.5))
     ax.plot(sweep.index, sweep["mean_rolling_std"], color="tab:brown", marker=".", markersize=3)
     ax.axvline(reference_theta, color="black", linewidth=0.8, linestyle="--",
-               label=f"Surveyed String 1 Normal ({reference_theta:.1f} deg)")
+               label=f"Surveyed String 1 Normal ({reference_theta:.2f} deg)")
+    if min_theta is not None:
+        ax.plot(min_theta, min_value, marker="o", color="tab:red", markersize=7, zorder=5,
+                label=f"Minimum ({min_theta:.2f} deg, {min_value:.2f})")
+        ax.annotate(f"{min_theta:.2f} deg", xy=(min_theta, min_value),
+                    xytext=(0, 12), textcoords="offset points", ha="center",
+                    color="tab:red", fontweight="bold")
     ax.set_xlabel("Assumed Panel-Normal Angle (deg): 0 = -X (nose), 90 = +Z (up), 180 = +X (tail)")
     ax.set_ylabel(f"Mean {PCT_DIFF_ROLLING_WINDOW_S / 60.0:.0f}-min Rolling Std of % Difference")
     ax.set_title("String 1: Panel-Normal Angle Sweep vs. % Difference Scatter", fontweight="bold")
@@ -1474,8 +1487,9 @@ def main() -> None:
             if not args.no_open:
                 open_in_vscode(pct_diff_plot_path)
 
-            print("Sweeping String 1 panel-normal angle (0-180 deg, 1 deg steps) ...")
-            sweep = sweep_panel_normal_angle(df, args)
+            print("Sweeping String 1 panel-normal angle (75-125 deg, 0.05 deg steps) ...")
+            sweep = sweep_panel_normal_angle(df, args, angle_min_deg=75.0, angle_max_deg=125.0,
+                                              angle_step_deg=0.05)
             sweep_plot_path = out_dir / f"{stem}_normal_sweep.png"
             make_normal_sweep_plot(sweep, sweep_plot_path)
             if not args.no_open:
