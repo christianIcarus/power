@@ -1036,27 +1036,36 @@ def rolling_band(series: pd.Series, window_s: float):
     return center, half_width
 
 
-def plot_pct_diff_panel(ax, df: pd.DataFrame, show_band: bool = True) -> None:
-    """Draws the String 1 % Difference (measured vs. estimated) panel --
+def plot_pct_diff_panel(ax, df: pd.DataFrame, show_band: bool = True,
+                         pct_diff: pd.Series = None, title: str = None) -> None:
+    """Draws a String 1 % Difference (measured vs. estimated) panel --
     flight-phase shading, raw trace, 0% reference, and (if show_band)
     a rolling mean/std band -- onto `ax`. Factored out of make_string1_plot()
     so make_string1_plot() (as its bottom panel), make_string1_pct_diff_plot()
     (as its own standalone figure), and make_normal_sweep_plot() (as its top
-    panel) render identically instead of drifting apart.
+    and bottom panels) render identically instead of drifting apart.
 
     show_band=False gives the plain raw trace with no rolling overlay --
     used for the standalone copy, since the decorated version now lives
     alongside the angle-sweep plot instead.
+
+    pct_diff overrides the default df["pre_mppt_efficiency_string1_pct"] - 100
+    -- e.g. make_normal_sweep_plot()'s bottom panel passes in
+    compute_pct_diff_at_angle()'s result to show the % Difference under the
+    empirically optimal angle instead of the surveyed one. title likewise
+    overrides the default title, so that panel can say which angle it used.
 
     Does not add a legend -- callers place that differently (inside vs.
     outside the axes, extra handles or not), so each calls its own
     ax.legend(...)/legend_outside(...) afterward.
     """
     shade_flight_phases([ax], df["flight_phase"])
-    # % difference from estimated (measured/estimated - 1) x 100, not the
-    # raw ratio -- 0% = measured matches estimated, +/- reads directly as
-    # over/under, rather than needing to mentally subtract 100 each time.
-    pct_diff = df["pre_mppt_efficiency_string1_pct"] - 100.0
+    if pct_diff is None:
+        # % difference from estimated (measured/estimated - 1) x 100, not
+        # the raw ratio -- 0% = measured matches estimated, +/- reads
+        # directly as over/under, rather than needing to mentally subtract
+        # 100 each time.
+        pct_diff = df["pre_mppt_efficiency_string1_pct"] - 100.0
     if show_band:
         window_min = PCT_DIFF_ROLLING_WINDOW_S / 60.0
         center, half_width = rolling_band(pct_diff, PCT_DIFF_ROLLING_WINDOW_S)
@@ -1072,7 +1081,7 @@ def plot_pct_diff_panel(ax, df: pd.DataFrame, show_band: bool = True) -> None:
                 label="String 1 % Difference (Measured vs. Estimated)")
     ax.axhline(0.0, color="black", linewidth=0.8, linestyle=":", label="0% (measured = estimated)")
     ax.set_ylabel("% Difference")
-    ax.set_title("String 1: % Difference, Measured vs. Estimated Power", fontweight="bold")
+    ax.set_title(title or "String 1: % Difference, Measured vs. Estimated Power", fontweight="bold")
 
 
 def make_string1_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
@@ -1264,6 +1273,47 @@ def make_poa_strings_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     print(f"Saved plot -> {out_path}")
 
 
+def compute_pct_diff_at_angle(window: pd.DataFrame, args, theta_deg: float) -> pd.Series:
+    """String 1's % Difference (measured vs. estimated, already offset -100)
+    recomputed with the panel normal fixed at theta_deg -- same x_cad(theta) =
+    -cos(theta), z_cad(theta) = sin(theta) parameterization as
+    sweep_panel_normal_angle() -- instead of the surveyed PANEL_NORMAL_BODY_
+    STRING_1. Factored out of that function's inner loop so the identical
+    per-angle calculation can also drive a real time-series plot (see
+    make_normal_sweep_plot()'s bottom panel) instead of only a reduced
+    summary statistic.
+
+    `window` must already be restricted to whatever time range the caller
+    wants (e.g. keep_main_hold()'s "zones 1-3") -- this function does no
+    windowing of its own, so the same `window` can be reused across many
+    calls without recomputing it each time.
+    """
+    roll = window["roll_deg"].values
+    pitch = window["pitch_deg"].values
+    yaw = window["yaw_deg"].values
+    elevation = window["sun_elevation_deg"].values
+    azimuth = window["sun_azimuth_deg"].values
+    dni = window["dni_w_m2"].values
+    temp_derate_factor = window["temp_derate_factor"].values
+    measured = window["pv_power_w_1"]
+    sun_up = window["sun_elevation_deg"] > 0
+
+    area_string1_m2 = args.string1_cell_count * args.cell_area_cm2 / 1e4
+    encapsulation_transmission = args.etfe_transmission * args.poe_transmission
+
+    theta = np.radians(theta_deg)
+    normal_body = _panel_normal_body(x_cad=-np.cos(theta), z_cad=np.sin(theta))
+    cos_aoi = cos_incidence_angle(roll, pitch, yaw, elevation, azimuth, normal_body=normal_body)
+    estimated_w = dni * cos_aoi * area_string1_m2 * args.cell_efficiency * encapsulation_transmission
+    estimated_w = estimated_w * temp_derate_factor
+    estimated_w = pd.Series(estimated_w, index=window.index)
+
+    valid = sun_up & (estimated_w > 1.0)
+    pct_diff = pd.Series(np.nan, index=window.index)
+    pct_diff.loc[valid] = 100.0 * measured.loc[valid] / estimated_w.loc[valid] - 100.0
+    return pct_diff
+
+
 def sweep_panel_normal_angle(df: pd.DataFrame, args, angle_min_deg: float = 0.0,
                               angle_max_deg: float = 180.0, angle_step_deg: float = 1.0) -> pd.DataFrame:
     """Sweep MPPT string 1's panel-normal unit vector through the aircraft's
@@ -1293,49 +1343,28 @@ def sweep_panel_normal_angle(df: pd.DataFrame, args, angle_min_deg: float = 0.0,
     entire window (no valid estimate to compare against).
     """
     window = keep_main_hold(df)
-    roll = window["roll_deg"].values
-    pitch = window["pitch_deg"].values
-    yaw = window["yaw_deg"].values
-    elevation = window["sun_elevation_deg"].values
-    azimuth = window["sun_azimuth_deg"].values
-    dni = window["dni_w_m2"].values
-    temp_derate_factor = window["temp_derate_factor"].values
-    measured = window["pv_power_w_1"]
-    sun_up = window["sun_elevation_deg"] > 0
-
-    area_string1_m2 = args.string1_cell_count * args.cell_area_cm2 / 1e4
-    encapsulation_transmission = args.etfe_transmission * args.poe_transmission
-
     angles = np.arange(angle_min_deg, angle_max_deg + angle_step_deg / 2.0, angle_step_deg)
     mean_rolling_std = []
     for theta_deg in angles:
-        theta = np.radians(theta_deg)
-        normal_body = _panel_normal_body(x_cad=-np.cos(theta), z_cad=np.sin(theta))
-        cos_aoi = cos_incidence_angle(roll, pitch, yaw, elevation, azimuth, normal_body=normal_body)
-        estimated_w = dni * cos_aoi * area_string1_m2 * args.cell_efficiency * encapsulation_transmission
-        estimated_w = estimated_w * temp_derate_factor
-        estimated_w = pd.Series(estimated_w, index=window.index)
-
-        valid = sun_up & (estimated_w > 1.0)
-        pct_diff = pd.Series(np.nan, index=window.index)
-        pct_diff.loc[valid] = 100.0 * measured.loc[valid] / estimated_w.loc[valid] - 100.0
-
+        pct_diff = compute_pct_diff_at_angle(window, args, theta_deg)
         _, half_width = rolling_band(pct_diff, PCT_DIFF_ROLLING_WINDOW_S)
         mean_rolling_std.append(half_width.mean())  # pandas .mean() skips NaN; all-NaN -> NaN, no warning
 
     return pd.DataFrame({"angle_deg": angles, "mean_rolling_std": mean_rolling_std}).set_index("angle_deg")
 
 
-def make_normal_sweep_plot(df: pd.DataFrame, sweep: pd.DataFrame, out_path: Path, tz: str) -> None:
-    """Two-panel figure: String 1's % Difference (measured vs. estimated),
-    WITH its rolling mean/std band (plot_pct_diff_panel(show_band=True)), on
-    top; sweep_panel_normal_angle()'s result -- mean rolling std vs. assumed
-    panel-normal angle -- below it. Puts the noisy time series and its
-    angle-sweep summary in one figure instead of two separate files.
-
-    A dip in the bottom panel identifies the angle that minimizes measured-
-    vs-estimated scatter; the assumed String 1 normal (PANEL_NORMAL_BODY_
-    STRING_1) and the sweep's own minimum are both marked for comparison.
+def make_normal_sweep_plot(df: pd.DataFrame, sweep: pd.DataFrame, out_path: Path, tz: str, args) -> None:
+    """Three-panel figure:
+      1. String 1's % Difference (measured vs. estimated) under the ASSUMED
+         normal (PANEL_NORMAL_BODY_STRING_1), with its rolling mean/std band
+         (plot_pct_diff_panel(show_band=True)).
+      2. sweep_panel_normal_angle()'s result -- mean rolling std vs. assumed
+         panel-normal angle. A dip identifies the angle that minimizes
+         measured-vs-estimated scatter; both the assumed normal and the
+         sweep's own minimum are marked (angle + std value in the legend).
+      3. The same % Difference as panel 1, but recomputed under the sweep's
+         OPTIMAL angle (compute_pct_diff_at_angle()) -- a direct visual
+         before/after of what that angle actually buys.
     """
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
@@ -1358,17 +1387,19 @@ def make_normal_sweep_plot(df: pd.DataFrame, sweep: pd.DataFrame, out_path: Path
 
     # Value of the curve at the assumed angle itself (nearest grid point --
     # assumed_theta generally doesn't land exactly on a sweep step), so the
-    # assumed normal's own scatter can be called out and compared numerically
-    # against the minimum, not just located on the x-axis via the vline.
+    # assumed normal's own scatter can be compared numerically against the
+    # minimum, not just located on the x-axis via the vline.
     nearest_pos = sweep.index.get_indexer([assumed_theta], method="nearest")[0]
     assumed_grid_theta = sweep.index[nearest_pos]
     assumed_value = sweep["mean_rolling_std"].iloc[nearest_pos]
     if pd.isna(assumed_value):
         assumed_value = None
 
-    fig, (ax_ts, ax_sweep) = plt.subplots(2, 1, figsize=(11, 10))
+    fig, (ax_ts, ax_sweep, ax_opt) = plt.subplots(3, 1, figsize=(11, 14.5))
 
-    plot_pct_diff_panel(ax_ts, ts, show_band=True)
+    plot_pct_diff_panel(ax_ts, ts, show_band=True,
+                        title=f"String 1: % Difference, Measured vs. Estimated Power "
+                              f"(Assumed Normal, {assumed_theta:.2f} deg)")
     ax_ts.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     ax_ts.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=ts.index.tz))
     ax_ts.set_xlabel(f"Local time, {tz} ({ts.index[0].date()})")
@@ -1376,32 +1407,37 @@ def make_normal_sweep_plot(df: pd.DataFrame, sweep: pd.DataFrame, out_path: Path
     ax_sweep.plot(sweep.index, sweep["mean_rolling_std"], color="tab:brown", marker=".", markersize=3)
     ax_sweep.axvline(assumed_theta, color="black", linewidth=0.8, linestyle="--",
                       label="Assumed String 1 Normal")
-    # Both callouts lean only slightly off-vertical (small horizontal offset,
-    # large vertical one) -- a callout that leans hard to one side runs
-    # roughly parallel to the curve's own rising slope on that side and ends
-    # up grazing/crossing it (what a wider, shallower offset did before).
-    # Staying close to vertical keeps the arrow crossing the curve exactly
-    # once, right at its own point. The two points sit only ~1 deg apart, so
-    # leaning them away from each other (left/right) is what keeps the two
-    # labels from colliding with each other.
     if assumed_value is not None:
         ax_sweep.plot(assumed_grid_theta, assumed_value, marker="o", color="tab:blue", markersize=7,
-                       zorder=5, label="Assumed Normal Std")
-        ax_sweep.annotate(f"Assumed: {assumed_theta:.2f} deg", xy=(assumed_grid_theta, assumed_value),
-                           xytext=(-15, 80), textcoords="offset points", ha="right",
-                           color="tab:blue", fontweight="bold",
-                           arrowprops=dict(arrowstyle="->", color="tab:blue", linewidth=1.0))
+                       zorder=5,
+                       label=f"Assumed Normal Std: {assumed_value:.2f} at {assumed_theta:.2f} deg")
     if min_theta is not None:
         ax_sweep.plot(min_theta, min_value, marker="o", color="tab:red", markersize=7, zorder=5,
-                       label="Minimum Std")
-        ax_sweep.annotate(f"Min: {min_theta:.2f} deg", xy=(min_theta, min_value),
-                           xytext=(15, 95), textcoords="offset points", ha="left",
-                           color="tab:red", fontweight="bold",
-                           arrowprops=dict(arrowstyle="->", color="tab:red", linewidth=1.0))
+                       label=f"Minimum Std: {min_value:.2f} at {min_theta:.2f} deg")
     ax_sweep.set_xlabel("Assumed Panel-Normal Angle (deg): 0 = -X (nose), 90 = +Z (up), 180 = +X (tail)")
     ax_sweep.set_ylabel(f"Mean {PCT_DIFF_ROLLING_WINDOW_S / 60.0:.0f}-min Rolling Std of % Difference")
-    ax_sweep.set_title("String 1: Panel-Normal Angle Sweep vs. % Difference Scatter", fontweight="bold")
+    ax_sweep.set_title("% Difference Rolling Deviation vs Panel-Normal Angle Sweep", fontweight="bold")
     ax_sweep.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+
+    if min_theta is not None:
+        optimized_pct_diff = compute_pct_diff_at_angle(ts, args, min_theta)
+        plot_pct_diff_panel(ax_opt, ts, show_band=True, pct_diff=optimized_pct_diff,
+                             title=f"String 1: % Difference, Measured vs. Estimated Power "
+                                   f"(Optimized Normal, {min_theta:.2f} deg)")
+        ax_opt.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+        ax_opt.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=ts.index.tz))
+        ax_opt.set_xlabel(f"Local time, {tz} ({ts.index[0].date()})")
+
+        # Same y-axis on both % Difference panels (assumed vs. optimized) so
+        # they're directly comparable at a glance -- otherwise each
+        # autoscales to its own outlier spikes and a real difference between
+        # the two can be masked by a mere axis-scale difference.
+        y_min = min(ax_ts.get_ylim()[0], ax_opt.get_ylim()[0])
+        y_max = max(ax_ts.get_ylim()[1], ax_opt.get_ylim()[1])
+        ax_ts.set_ylim(y_min, y_max)
+        ax_opt.set_ylim(y_min, y_max)
+    else:
+        ax_opt.axis("off")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -1543,7 +1579,7 @@ def main() -> None:
             sweep = sweep_panel_normal_angle(df, args, angle_min_deg=90.0, angle_max_deg=105.0,
                                               angle_step_deg=0.05)
             sweep_plot_path = out_dir / f"{stem}_normal_sweep.png"
-            make_normal_sweep_plot(df, sweep, sweep_plot_path, tz)
+            make_normal_sweep_plot(df, sweep, sweep_plot_path, tz, args)
             if not args.no_open:
                 open_in_vscode(sweep_plot_path)
         else:
