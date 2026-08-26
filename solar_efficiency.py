@@ -1036,12 +1036,17 @@ def rolling_band(series: pd.Series, window_s: float):
     return center, half_width
 
 
-def plot_pct_diff_panel(ax, df: pd.DataFrame) -> None:
+def plot_pct_diff_panel(ax, df: pd.DataFrame, show_band: bool = True) -> None:
     """Draws the String 1 % Difference (measured vs. estimated) panel --
-    flight-phase shading, rolling mean/std band, raw trace, 0% reference --
-    onto `ax`. Factored out of make_string1_plot() so make_string1_plot()
-    (as its bottom panel) and make_string1_pct_diff_plot() (as its own
-    standalone figure) render identically instead of drifting apart.
+    flight-phase shading, raw trace, 0% reference, and (if show_band)
+    a rolling mean/std band -- onto `ax`. Factored out of make_string1_plot()
+    so make_string1_plot() (as its bottom panel), make_string1_pct_diff_plot()
+    (as its own standalone figure), and make_normal_sweep_plot() (as its top
+    panel) render identically instead of drifting apart.
+
+    show_band=False gives the plain raw trace with no rolling overlay --
+    used for the standalone copy, since the decorated version now lives
+    alongside the angle-sweep plot instead.
 
     Does not add a legend -- callers place that differently (inside vs.
     outside the axes, extra handles or not), so each calls its own
@@ -1052,15 +1057,19 @@ def plot_pct_diff_panel(ax, df: pd.DataFrame) -> None:
     # raw ratio -- 0% = measured matches estimated, +/- reads directly as
     # over/under, rather than needing to mentally subtract 100 each time.
     pct_diff = df["pre_mppt_efficiency_string1_pct"] - 100.0
-    window_min = PCT_DIFF_ROLLING_WINDOW_S / 60.0
-    center, half_width = rolling_band(pct_diff, PCT_DIFF_ROLLING_WINDOW_S)
-    ax.fill_between(df.index, center - half_width, center + half_width,
-                     color="tab:brown", alpha=0.15, zorder=1,
-                     label=f"{window_min:.0f}-min Rolling Std")
-    ax.plot(df.index, pct_diff, color="tab:brown", alpha=0.5, linewidth=0.8,
-            label="String 1 % Difference (Measured vs. Estimated)")
-    ax.plot(df.index, center, color="black", linewidth=1.2,
-            label=f"{window_min:.0f}-min Rolling Mean")
+    if show_band:
+        window_min = PCT_DIFF_ROLLING_WINDOW_S / 60.0
+        center, half_width = rolling_band(pct_diff, PCT_DIFF_ROLLING_WINDOW_S)
+        ax.fill_between(df.index, center - half_width, center + half_width,
+                         color="tab:brown", alpha=0.15, zorder=1,
+                         label=f"{window_min:.0f}-min Rolling Std")
+        ax.plot(df.index, pct_diff, color="tab:brown", alpha=0.5, linewidth=0.8,
+                label="String 1 % Difference (Measured vs. Estimated)")
+        ax.plot(df.index, center, color="black", linewidth=1.2,
+                label=f"{window_min:.0f}-min Rolling Mean")
+    else:
+        ax.plot(df.index, pct_diff, color="tab:brown",
+                label="String 1 % Difference (Measured vs. Estimated)")
     ax.axhline(0.0, color="black", linewidth=0.8, linestyle=":", label="0% (measured = estimated)")
     ax.set_ylabel("% Difference")
     ax.set_title("String 1: % Difference, Measured vs. Estimated Power", fontweight="bold")
@@ -1150,9 +1159,10 @@ def make_string1_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
 def make_string1_pct_diff_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     """Standalone copy of make_string1_plot()'s bottom panel -- % Difference
     (measured vs. estimated), String 1 -- as its own single-panel figure.
-    Same data, same "zones 1-3" window (keep_main_hold()), same rolling
-    band (plot_pct_diff_panel()) as the full 4-panel plot; this just lets
-    that one panel be viewed/shared on its own.
+    Same data and "zones 1-3" window (keep_main_hold()) as the full 4-panel
+    plot, but plain (no rolling mean/std band, see plot_pct_diff_panel()) --
+    the decorated version now lives in make_normal_sweep_plot()'s top panel
+    instead, so this one stays simple.
     """
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
@@ -1162,7 +1172,7 @@ def make_string1_pct_diff_plot(df: pd.DataFrame, out_path: Path, tz: str) -> Non
     df = keep_main_hold(df)
 
     fig, ax = plt.subplots(figsize=(12, 4.5))
-    plot_pct_diff_panel(ax, df)
+    plot_pct_diff_panel(ax, df, show_band=False)
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
     ax.set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
@@ -1316,41 +1326,62 @@ def sweep_panel_normal_angle(df: pd.DataFrame, args, angle_min_deg: float = 0.0,
     return pd.DataFrame({"angle_deg": angles, "mean_rolling_std": mean_rolling_std}).set_index("angle_deg")
 
 
-def make_normal_sweep_plot(sweep: pd.DataFrame, out_path: Path) -> None:
-    """Plots sweep_panel_normal_angle()'s result: mean % Difference rolling
-    std vs. assumed panel-normal angle. A dip identifies the angle that
-    minimizes measured-vs-estimated scatter; the surveyed String 1 normal
-    (PANEL_NORMAL_BODY_STRING_1) and the sweep's own minimum are both marked
-    for comparison against each other.
+def make_normal_sweep_plot(df: pd.DataFrame, sweep: pd.DataFrame, out_path: Path, tz: str) -> None:
+    """Two-panel figure: String 1's % Difference (measured vs. estimated),
+    WITH its rolling mean/std band (plot_pct_diff_panel(show_band=True)), on
+    top; sweep_panel_normal_angle()'s result -- mean rolling std vs. assumed
+    panel-normal angle -- below it. Puts the noisy time series and its
+    angle-sweep summary in one figure instead of two separate files.
+
+    A dip in the bottom panel identifies the angle that minimizes measured-
+    vs-estimated scatter; the assumed String 1 normal (PANEL_NORMAL_BODY_
+    STRING_1) and the sweep's own minimum are both marked for comparison.
     """
+    import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
+
+    local_index = df.index.tz_convert(tz)
+    ts = df.set_axis(local_index)
+    ts = keep_main_hold(ts)
 
     # Invert _panel_normal_body()'s (x_cad, z_cad) -> (nx, ny, nz) = normalize(
     # [-x_cad, 0, -z_cad]) to recover the angle this sweep would assign the
-    # surveyed String 1 normal: cos(theta) = nx, sin(theta) = -nz (the
+    # assumed String 1 normal: cos(theta) = nx, sin(theta) = -nz (the
     # normalization factor cancels out of the ratio, so it doesn't matter
     # that PANEL_NORMAL_BODY_STRING_1's inputs weren't exactly unit length).
     nx, _, nz = PANEL_NORMAL_BODY_STRING_1
-    reference_theta = np.degrees(np.arctan2(-nz, nx))
+    assumed_theta = np.degrees(np.arctan2(-nz, nx))
 
     valid = sweep["mean_rolling_std"].dropna()
     min_theta = valid.idxmin() if not valid.empty else None
     min_value = valid.min() if not valid.empty else None
 
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    ax.plot(sweep.index, sweep["mean_rolling_std"], color="tab:brown", marker=".", markersize=3)
-    ax.axvline(reference_theta, color="black", linewidth=0.8, linestyle="--",
-               label=f"Surveyed String 1 Normal ({reference_theta:.2f} deg)")
+    fig, (ax_ts, ax_sweep) = plt.subplots(2, 1, figsize=(11, 10))
+
+    plot_pct_diff_panel(ax_ts, ts, show_band=True)
+    ax_ts.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+    ax_ts.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=ts.index.tz))
+    ax_ts.set_xlabel(f"Local time, {tz} ({ts.index[0].date()})")
+
+    ax_sweep.plot(sweep.index, sweep["mean_rolling_std"], color="tab:brown", marker=".", markersize=3)
+    ax_sweep.axvline(assumed_theta, color="black", linewidth=0.8, linestyle="--",
+                      label=f"Assumed String 1 Normal ({assumed_theta:.2f} deg)")
     if min_theta is not None:
-        ax.plot(min_theta, min_value, marker="o", color="tab:red", markersize=7, zorder=5,
-                label=f"Minimum ({min_theta:.2f} deg, {min_value:.2f})")
-        ax.annotate(f"{min_theta:.2f} deg", xy=(min_theta, min_value),
-                    xytext=(0, 12), textcoords="offset points", ha="center",
-                    color="tab:red", fontweight="bold")
-    ax.set_xlabel("Assumed Panel-Normal Angle (deg): 0 = -X (nose), 90 = +Z (up), 180 = +X (tail)")
-    ax.set_ylabel(f"Mean {PCT_DIFF_ROLLING_WINDOW_S / 60.0:.0f}-min Rolling Std of % Difference")
-    ax.set_title("String 1: Panel-Normal Angle Sweep vs. % Difference Scatter", fontweight="bold")
-    ax.legend(loc="best")
+        ax_sweep.plot(min_theta, min_value, marker="o", color="tab:red", markersize=7, zorder=5,
+                       label=f"Minimum ({min_theta:.2f} deg, {min_value:.2f})")
+        # Offset well clear of the marker and the curve's rising sides, with
+        # an arrow pointing back to the point -- putting the text directly
+        # on/above the marker (the old approach) crowded it right where the
+        # dip is narrowest.
+        ax_sweep.annotate(f"Min: {min_theta:.2f} deg", xy=(min_theta, min_value),
+                           xytext=(45, 40), textcoords="offset points", ha="left",
+                           color="tab:red", fontweight="bold",
+                           arrowprops=dict(arrowstyle="->", color="tab:red", linewidth=1.0))
+    ax_sweep.set_xlabel("Assumed Panel-Normal Angle (deg): 0 = -X (nose), 90 = +Z (up), 180 = +X (tail)")
+    ax_sweep.set_ylabel(f"Mean {PCT_DIFF_ROLLING_WINDOW_S / 60.0:.0f}-min Rolling Std of % Difference")
+    ax_sweep.set_title("String 1: Panel-Normal Angle Sweep vs. % Difference Scatter", fontweight="bold")
+    ax_sweep.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved plot -> {out_path}")
@@ -1491,7 +1522,7 @@ def main() -> None:
             sweep = sweep_panel_normal_angle(df, args, angle_min_deg=75.0, angle_max_deg=125.0,
                                               angle_step_deg=0.05)
             sweep_plot_path = out_dir / f"{stem}_normal_sweep.png"
-            make_normal_sweep_plot(sweep, sweep_plot_path)
+            make_normal_sweep_plot(df, sweep, sweep_plot_path, tz)
             if not args.no_open:
                 open_in_vscode(sweep_plot_path)
         else:
