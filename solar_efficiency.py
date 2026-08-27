@@ -1346,7 +1346,8 @@ def rolling_band(series: pd.Series, window_s: float):
 
 
 def plot_pct_diff_panel(ax, df: pd.DataFrame, show_band: bool = True,
-                         pct_diff: pd.Series = None, title: str = None) -> None:
+                         pct_diff: pd.Series = None, title: str = None,
+                         label: str = None) -> None:
     """Draws a String 1 % Difference (measured vs. estimated) panel --
     flight-phase shading, raw trace, 0% reference, and (if show_band)
     a rolling mean/std band -- onto `ax`. Factored out of make_string1_plot()
@@ -1362,7 +1363,10 @@ def plot_pct_diff_panel(ax, df: pd.DataFrame, show_band: bool = True,
     -- e.g. make_normal_sweep_plot()'s bottom panel passes in
     compute_pct_diff_at_angle()'s result to show the % Difference under the
     empirically optimal angle instead of the surveyed one. title likewise
-    overrides the default title, so that panel can say which angle it used.
+    overrides the default title, so that panel can say which angle it used,
+    and label overrides the raw trace's legend text the same way (e.g.
+    make_string1_best_fit_temperature_plot() says "Best-Fit Estimated"
+    instead of just "Estimated").
 
     Does not add a legend -- callers place that differently (inside vs.
     outside the axes, extra handles or not), so each calls its own
@@ -1375,6 +1379,7 @@ def plot_pct_diff_panel(ax, df: pd.DataFrame, show_band: bool = True,
         # directly as over/under, rather than needing to mentally subtract
         # 100 each time.
         pct_diff = df["pre_mppt_efficiency_string1_pct"] - 100.0
+    label = label or "String 1 % Difference (Measured vs. Estimated)"
     if show_band:
         window_min = PCT_DIFF_ROLLING_WINDOW_S / 60.0
         center, half_width = rolling_band(pct_diff, PCT_DIFF_ROLLING_WINDOW_S)
@@ -1382,12 +1387,11 @@ def plot_pct_diff_panel(ax, df: pd.DataFrame, show_band: bool = True,
                          color="tab:brown", alpha=0.15, zorder=1,
                          label=f"{window_min:.0f}-min Rolling Std")
         ax.plot(df.index, pct_diff, color="tab:brown", alpha=0.5, linewidth=0.8,
-                label="String 1 % Difference (Measured vs. Estimated)")
+                label=label)
         ax.plot(df.index, center, color="black", linewidth=1.2,
                 label=f"{window_min:.0f}-min Rolling Mean")
     else:
-        ax.plot(df.index, pct_diff, color="tab:brown",
-                label="String 1 % Difference (Measured vs. Estimated)")
+        ax.plot(df.index, pct_diff, color="tab:brown", label=label)
     ax.axhline(0.0, color="black", linewidth=0.8, linestyle=":", label="0% (measured = estimated)")
     ax.set_ylabel("% Difference")
     ax.set_title(title or "String 1: % Difference, Measured vs. Estimated Power", fontweight="bold")
@@ -1516,6 +1520,119 @@ def make_string1_pct_diff_plot(df: pd.DataFrame, out_path: Path, tz: str) -> Non
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
     ax.set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved plot -> {out_path}")
+
+
+def make_string1_best_fit_temperature_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
+    """Same 4-panel layout as make_string1_plot(), but the estimated power
+    is temperature-corrected using the BEST-FIT Tout model -- the piecewise-
+    linear-target -> 2nd-order-with-RHP-zero response from
+    fit_tout_piecewise_model() -- fed through the standard derate formula
+    (1 + coeff%/degC * (T - STC)) instead of leaving temperature out entirely
+    (the default) or using raw measured Tout (--apply-temp-derate).
+
+    Why the model and not raw Tout: the raw trace carries a ~+/- few degC
+    periodic measurement ripple (same period as the POA oscillation), so a
+    raw-Tout derate injects that ripple straight into the estimated-power
+    denominator. The fitted response is the smooth trend underneath, which
+    is closer to what the cells' bulk temperature can physically do anyway.
+
+    Same sign convention caveat as everywhere else: the coefficient is
+    negative, so modeled Tout BELOW 25 degC RAISES estimated power (a gain,
+    factor > 1) -- on a cold high-altitude cruise this makes the estimate
+    larger and the % difference correspondingly more negative, which is
+    correct: cold cells really can deliver more than their 25-degC rating.
+
+    Skipped (with a note) if the Tout model can't be fit on this log --
+    no tout_c, or the flight lacks the holding_high -> descending ->
+    holding_low sequence the fit anchors to. Same "zones 1-3" window
+    (keep_main_hold()) as make_string1_plot(); the fit metadata prints
+    from make_string1_plot() already, so this one refits quietly.
+    """
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    local_index = df.index.tz_convert(tz)
+    df = df.set_axis(local_index)
+    df = keep_main_hold(df)
+
+    tout_fit = fit_tout_piecewise_model(df)
+    if tout_fit is None:
+        print("  (note: Tout model could not be fit on this log - skipping the "
+              "best-fit-temperature plot)")
+        return
+    tout_model = tout_fit["model"]
+
+    # Rebuild the estimate from the encapsulated no-derate tier: when
+    # --apply-temp-derate is on, pv_power_estimated_string1_w already has the
+    # measured-Tout derate baked in, and stacking a second derate on top would
+    # double-count temperature -- the nominal column is kept in exactly that
+    # case (see analyze()), so prefer it when present.
+    nominal_w = df.get("pv_power_estimated_nominal_string1_w",
+                       df["pv_power_estimated_string1_w"])
+    derate = (1.0 + (POWER_TEMP_COEFF_PCT_PER_C / 100.0)
+              * (tout_model.clip(*TOUT_CLAMP_RANGE_C) - STC_TEMP_C)).clip(lower=0.0)
+    best_fit_w = nominal_w * derate
+
+    # Same validity gating as analyze()'s string-1 efficiency: sun up and a
+    # non-vanishing estimate, so the ratio can't blow up around dawn/dusk.
+    pct_diff = pd.Series(np.nan, index=df.index)
+    valid = (df["sun_elevation_deg"] > 0) & (best_fit_w > 1.0)
+    pct_diff[valid] = 100.0 * df.loc[valid, "pv_power_w_1"] / best_fit_w[valid] - 100.0
+
+    fig, axes = plt.subplots(4, 1, figsize=(12, 13.5), sharex=True)
+
+    def legend_outside(ax, *extra_axes):
+        handles, labels = ax.get_legend_handles_labels()
+        for extra in extra_axes:
+            h, l = extra.get_legend_handles_labels()
+            handles += h
+            labels += l
+        ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.06, 1.0), borderaxespad=0.0)
+
+    ax = axes[0]
+    ax.plot(df.index, df["alt_msl_m"], color="tab:purple", label="Altitude (MSL)")
+    ax.set_ylabel("Altitude MSL (m)")
+    ax2 = ax.twinx()
+    ax2.plot(df.index, df["tout_c"], color="tab:brown", label="Fuselage Skin Temp (Tout Proxy)")
+    ax2.plot(df.index, tout_model, color="tab:blue", linewidth=1.8,
+             label=f"Tout 2nd-Order Model, RHP Zero "
+                   f"(T_z={tout_fit['t_z']:.0f}s, RMSE {tout_fit['rmse_c']:.2f} degC)")
+    ax2.axhline(STC_TEMP_C, color="black", linewidth=0.8, linestyle=":", label=f"STC ({STC_TEMP_C:.0f} degC)")
+    ax2.set_ylabel("Temp (degC)")
+    ax.set_title("Environmentals", fontweight="bold")
+    legend_outside(ax, ax2)
+
+    ax = axes[1]
+    # The derate factor the model produces, so the power panel's gap between
+    # the two estimate tiers is traceable to a number rather than implied.
+    ax.plot(df.index, derate, color="tab:cyan",
+            label=f"Best-Fit Temp Derate Factor ({POWER_TEMP_COEFF_PCT_PER_C}%/degC vs {STC_TEMP_C:.0f} degC)")
+    ax.axhline(1.0, color="black", linewidth=0.8, linestyle=":", label="1.0 (no temperature effect)")
+    ax.set_ylabel("Derate factor")
+    ax.set_title("String 1: Best-Fit Temperature Derate", fontweight="bold")
+    legend_outside(ax)
+
+    ax = axes[2]
+    ax.plot(df.index, df["pv_power_w_1"], color="tab:blue", label="String 1 Measured Power")
+    ax.plot(df.index, df["pv_power_estimated_string1_w"], color="tab:olive", linestyle="-.",
+            alpha=0.45, label="String 1 Estimated Power (No Temp Derate)")
+    ax.plot(df.index, best_fit_w, color="tab:green", linestyle="--",
+            label="String 1 Best-Fit Estimated Power (Modeled Tout Derate)")
+    ax.set_ylabel("Power (W)")
+    ax.set_title("String 1: Measured vs. Best-Fit Estimated Power", fontweight="bold")
+    legend_outside(ax)
+
+    ax = axes[3]
+    plot_pct_diff_panel(ax, df, show_band=False, pct_diff=pct_diff,
+                        title="String 1: % Difference, Measured vs. Best-Fit Estimated Power",
+                        label="String 1 % Difference (Measured vs. Best-Fit Estimated)")
+    legend_outside(ax)
+
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
+    axes[-1].set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved plot -> {out_path}")
@@ -1905,6 +2022,11 @@ def main() -> None:
             make_string1_pct_diff_plot(df, pct_diff_plot_path, tz)
             if not args.no_open:
                 open_in_vscode(pct_diff_plot_path)
+
+            best_fit_plot_path = out_dir / f"{stem}_string1_best_fit_temperature.png"
+            make_string1_best_fit_temperature_plot(df, best_fit_plot_path, tz)
+            if not args.no_open and best_fit_plot_path.exists():
+                open_in_vscode(best_fit_plot_path)
 
             print("Sweeping String 1 panel-normal angle (90-105 deg, 0.05 deg steps) ...")
             sweep = sweep_panel_normal_angle(df, args, angle_min_deg=90.0, angle_max_deg=105.0,
