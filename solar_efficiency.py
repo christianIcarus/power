@@ -650,6 +650,311 @@ def keep_main_hold(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------
+# Tout model: piecewise-linear target -> non-minimum-phase 2nd-order response
+# --------------------------------------------------------------------------
+# All three fitted parameters (T_z, tau_1, tau_2) are TIMES, so they're
+# seeded and bounded relative to the descent's own duration rather than as
+# absolute seconds -- no retuning needed for a longer or shorter descent.
+# Several starts are tried because the inverse-response surface has local
+# minima (a shallow-dip/slow-lag fit and a deep-dip/fast-lag fit can both be
+# locally optimal); the best is kept. Each start is cheap -- the response is
+# closed-form, not integrated.
+#   a_1 = tau_1 + tau_2   [s]    a_2 = tau_1*tau_2   [s^2]
+#   T_z = RHP zero time   [s]    R   = target ramp rate [degC/s]
+# a_1/a_2 (the denominator's coefficients) rather than (tau_1, tau_2): the two
+# time constants enter the model symmetrically, so fitting them directly has an
+# exact exchange symmetry whose Jacobian is rank-deficient along tau_1 == tau_2
+# -- which is where the optimum for this data actually sits. The elementary
+# symmetric pair quotients that symmetry out, stays smooth through the repeated
+# root, AND spans complex poles (a_1^2 < 4*a_2), which the real-(tau_1, tau_2)
+# form cannot reach. Bounds are in units of the descent duration / total dT, so
+# nothing needs retuning for a different profile.
+TOUT_FIT_BOUNDS_REL = {              # (lo, hi) x descent_duration**power
+    "a_1": (5e-3, 5.0),              # x D
+    "a_2": (2e-5, 25.0),             # x D^2
+    "t_z": (2e-3, 3.0),              # x D
+    "ramp": (0.3, 20.0),             # x (dT / D)
+}
+TOUT_FIT_STARTS_REL = (               # (a_1, a_2, T_z, ramp) in those same units
+    (0.20, 1.4e-2, 0.16, 1.0),
+    (0.20, 1.0e-2, 0.20, 4.6),
+    (0.05, 1.0e-3, 0.05, 2.0),
+    (0.50, 6.0e-2, 0.50, 1.5),
+    (0.10, 2.5e-3, 0.10, 8.0),
+    (1.00, 2.5e-1, 0.30, 1.0),
+    (0.30, 2.0e-2, 0.60, 3.0),
+    (0.08, 1.6e-3, 0.30, 6.0),
+    (0.60, 9.0e-2, 0.10, 2.5),
+    (0.15, 5.6e-3, 0.40, 12.0),
+)
+
+
+def _tout_nmp_response(t_s: np.ndarray, high_end_s: float, t_high: float, delta_t: float,
+                        t_z: float, a_1: float, a_2: float, ramp_rate: float) -> np.ndarray:
+    """Exact response of the non-minimum-phase 2nd-order system
+
+        T(s)/U(s) = (1 - T_z*s) / (a_2*s^2 + a_1*s + 1),   T_z > 0
+
+    (a_1 = tau_1 + tau_2, a_2 = tau_1*tau_2 -- so this spans complex poles,
+    a_1^2 < 4*a_2, not just two real lags) to U = the piecewise-linear Tout
+    target: flat at t_high, a linear ramp at ramp_rate, then flat at
+    t_high + delta_t once the ramp has covered delta_t. Evaluated at t_s
+    (seconds from window start); high_end_s is where the ramp starts.
+
+    The ramp's DURATION is T_r = delta_t/ramp_rate, a fitted quantity, NOT
+    pinned to the descent's length. That matters: pinning it makes the dip
+    depth and the terminal error the same number (both ~ramp_rate*(T_z+a_1)),
+    so a deep dip forces the response to end that far below t_low -- and the
+    measured trace has a deep dip AND arrives on the low hold on time. Letting
+    T_r float decouples them. See fit_tout_piecewise_model() for the physical
+    caveat this buys.
+
+    Why the RHP (positive) zero: the measured skin temp dips BELOW its own
+    cruise level early in the descent, then rises. Driven by this U -- which
+    never goes below t_high -- no minimum-phase lag can do that. For a
+    first-order lag, T' = (U - T)/tau is >= 0 whenever T <= t_high <= U, so
+    T can never leave downward; for a 2nd-order system with no zero and
+    T'(0) = 0, T'''(0) = +r/(tau_1*tau_2) > 0, same conclusion. The zero has
+    to be in the transfer function. Cross-multiplying the TF gives the ODE
+
+        tau_1*tau_2*T'' + (tau_1 + tau_2)*T' + T = U - T_z*U'
+
+    and it is the -T_z*U' term -- switching on the instant the ramp starts --
+    that drives the response the "wrong way" first.
+
+    NOTE on interpretation: the dip physically originates as a FORCING
+    excursion (the convection-weighted equilibrium temperature collapsing
+    toward the ~-56 degC ambient as air density builds during descent, while
+    at cruise thin air and absorbed sunlight hold the skin ~18 degC above
+    ambient). Because the piecewise-linear target carries no such excursion,
+    that physics gets folded into the response instead, and an RHP zero is
+    what it looks like once folded -- which is why "two competing paths with
+    opposite signs", K1/(tau_1*s+1) - K2/(tau_2*s+1), is algebraically the
+    same model (match coefficients: K1 - K2 = 1, K1*tau_2 - K2*tau_1 = -T_z).
+    Consequence for reuse: T_z is PROFILE-SPECIFIC. It stands in for physics
+    that scales with descent rate and with the cruise skin-minus-ambient
+    offset, NOT with the target's ramp slope, so refit it if either changes
+    materially. Generalizing across profiles means moving the dip to the
+    input side (build U from altitude + ISA + a solar term) rather than
+    leaning harder on T_z.
+
+    Solved in closed form rather than numerically integrated: for U a single
+    ramp, U - T_z*U' is linear, so the exact solution is two decaying
+    exponentials plus a linear particular solution. The saturating
+    ("ramp-and-hold") target is then just SUPERPOSITION of two such ramp
+    responses offset by T_r -- one rising ramp minus the same ramp restarted
+    at T_r, which cancels the slope and leaves a constant. That is exact at
+    any sample spacing (this log's timestamps are irregular), fully
+    vectorized, and needs no per-region boundary algebra, which matters
+    because the optimizer evaluates it repeatedly over ~32k samples.
+
+    Continuity is automatic everywhere, in value AND slope: the response
+    leaves the high hold tangentially (y(0) = y'(0) = 0, matching the hold's
+    dT/dt = 0), and as t grows past T_r the superposition tends to
+    ramp_rate*T_r = delta_t with zero slope, i.e. it settles onto the low
+    hold with no junction step of either kind. (The previous formulation's
+    4.15 degC step at that junction is structurally gone, not merely fitted
+    away.)
+
+    Numerical safety: poles solve a_2*s^2 + a_1*s + 1 = 0 and both have
+    Re(s) < 0 whenever a_1, a_2 > 0 (Routh), so every exponential decays --
+    nothing can overflow however far the optimizer wanders. The complex sqrt
+    handles real and complex pole pairs in one expression. Only a repeated
+    root is degenerate (the A/B solve divides by s1 - s2), so the roots are
+    nudged apart by a relative epsilon; unlike the (tau_1, tau_2) form, the
+    optimizer has no reason to sit exactly there.
+
+    NOTE the -T_z*U' term's effect is on CURVATURE, not slope: under ramp
+    forcing U' steps 0 -> ramp_rate at onset, which puts a step of
+    -T_z*ramp_rate on the ODE's right-hand side, and with relative degree 1
+    a jump in U^(m) shows up in y^(m+1). So y''(0+) = -T_z*ramp_rate/a_2 < 0
+    -- the response leaves the hold tangentially and THEN bends the wrong
+    way, which is precisely what preserves dT/dt = 0 while still dipping.
+    """
+    disc = np.sqrt(np.complex128(a_1 * a_1 - 4.0 * a_2))
+    s_1 = (-a_1 + disc) / (2.0 * a_2)
+    s_2 = (-a_1 - disc) / (2.0 * a_2)
+    if abs(s_1 - s_2) < 1e-9 * abs(s_1):
+        s_2 = s_1 * (1.0 + 1e-9)
+
+    lag = a_1 + t_z          # G'(0) = -(a_1 + T_z): the zero adds to apparent lag
+    span = ramp_rate * lag
+    # y_p = ramp_rate*(t - lag); homogeneous coeffs from y(0) = y'(0) = 0.
+    coef_a = (-ramp_rate - s_2 * span) / (s_1 - s_2)
+    coef_b = span - coef_a
+
+    def ramp_response(t):
+        return (np.real(coef_a * np.exp(s_1 * t) + coef_b * np.exp(s_2 * t))
+                + ramp_rate * (t - lag))
+
+    ramp_s = delta_t / ramp_rate                    # T_r: fitted ramp duration
+    elapsed = np.maximum(t_s - high_end_s, 0.0)     # 0 while still on the high hold
+    y = ramp_response(elapsed)
+    past = elapsed > ramp_s
+    y[past] -= ramp_response(elapsed[past] - ramp_s)
+    return t_high + y
+
+
+def fit_tout_piecewise_model(df: pd.DataFrame):
+    """Model Tout (fuselage skin temp) across the "zones 1-3" window as a
+    piecewise-linear target driving a non-minimum-phase 2nd-order response.
+
+    Structure, per the constraints:
+      - The INPUT U is the piecewise-linear target: holding_high and
+        holding_low are LINEAR with d2T/dt2 = 0 AND dT/dt = 0, i.e. constant,
+        joined by a linear ramp across the descent. The least-squares
+        constant fit to a segment is just that segment's mean, so each hold
+        level IS the measured mean over it -- no optimizer needed for those.
+      - The RESPONSE to that input is the 2nd-order system with an RHP zero
+        (see _tout_nmp_response()), whose three time parameters T_z, tau_1,
+        tau_2 are fit by least squares against the measured descent Tout.
+
+    Fit residuals are taken over the DESCENT only -- that's the segment being
+    modeled, and the two hold levels are already pinned to their own means.
+    The low hold is then scored separately ("rmse_low_hold_c") as an
+    out-of-sample check that the tail settles where it should, rather than
+    being folded into the objective.
+
+    Returns a dict with the model Series plus fit metadata, or None if the
+    window lacks the columns/segments needed to anchor the fit.
+    """
+    from scipy.optimize import least_squares
+
+    if "flight_phase" not in df.columns or "tout_c" not in df.columns:
+        return None
+    phase, tout = df["flight_phase"], df["tout_c"]
+
+    # Same longest-segment identification as main_hold_window() -- a brief
+    # pre-takeoff or flickery landing-approach blip can share a phase label
+    # with the real holds, so length is what tells them apart.
+    change = phase.ne(phase.shift()).cumsum()
+    segments = [(seg.iloc[0], seg.index[0], seg.index[-1]) for _, seg in phase.groupby(change)]
+    highs = [s for s in segments if s[0] == "holding_high"]
+    if not highs:
+        return None
+    zone1 = max(highs, key=lambda s: s[2] - s[1])
+    lows_after = [s for s in segments if s[0] == "holding_low" and s[1] > zone1[2]]
+    if not lows_after:
+        return None
+    zone3 = max(lows_after, key=lambda s: s[2] - s[1])
+
+    high_end, low_start = zone1[2], zone3[1]
+    in_zone1 = (df.index >= zone1[1]) & (df.index <= high_end)
+    in_zone3 = (df.index >= low_start) & (df.index <= zone3[2])
+    in_descent = (df.index > high_end) & (df.index < low_start)
+
+    t_high = tout[in_zone1].mean()   # least-squares constant fit == the mean
+    t_low = tout[in_zone3].mean()
+    if not np.isfinite(t_high) or not np.isfinite(t_low) or in_descent.sum() < 10:
+        return None
+
+    # One shared time axis in seconds, so every region is evaluated by the
+    # same closed-form call rather than each region re-deriving its own origin.
+    t_s = (df.index - df.index[0]).total_seconds().values
+    high_end_s = float((high_end - df.index[0]).total_seconds())
+    low_start_s = float((low_start - df.index[0]).total_seconds())
+    duration_s = low_start_s - high_end_s
+    if duration_s <= 0 or in_descent.sum() < 10:
+        return None
+
+    # in_zone1/in_zone3/in_descent are plain numpy bool arrays (DatetimeIndex
+    # comparisons, not Series) -- index them directly, no .values.
+    measured = tout.values
+    fit_mask = in_descent & np.isfinite(measured)
+    if fit_mask.sum() < 10:
+        return None
+
+    delta_t = float(t_low - t_high)
+    # Natural scales for each parameter, so all four are fit as O(1) log
+    # multipliers of them -- keeps the Jacobian's columns comparable.
+    scales = np.array([duration_s, duration_s ** 2, duration_s, abs(delta_t) / duration_s])
+
+    def evaluate(params, mask=None):
+        a_1, a_2, t_z, ramp_rate = np.exp(params) * scales
+        target = t_s if mask is None else t_s[mask]
+        return _tout_nmp_response(target, high_end_s, t_high, delta_t,
+                                   t_z, a_1, a_2, ramp_rate)
+
+    def residual(params):
+        return evaluate(params, fit_mask) - measured[fit_mask]
+
+    keys = ("a_1", "a_2", "t_z", "ramp")
+    lo = np.log([TOUT_FIT_BOUNDS_REL[k][0] for k in keys])
+    hi = np.log([TOUT_FIT_BOUNDS_REL[k][1] for k in keys])
+    best = None
+    for start in TOUT_FIT_STARTS_REL:
+        x0 = np.clip(np.log(np.asarray(start, dtype=float)), lo, hi)
+        try:
+            trial = least_squares(residual, x0=x0, bounds=(lo, hi),
+                                   x_scale="jac", xtol=1e-12, ftol=1e-12)
+        except (ValueError, FloatingPointError):
+            continue
+        if best is None or trial.cost < best.cost:
+            best = trial
+    if best is None:
+        return None
+
+    a_1, a_2, t_z, ramp_rate = (float(v) for v in np.exp(best.x) * scales)
+    # Report the poles the fit actually landed on: real pair (two lags) when
+    # a_1^2 >= 4*a_2, otherwise a complex pair, which the (a_1, a_2) chart can
+    # reach but a real (tau_1, tau_2) parameterization structurally cannot.
+    disc = a_1 * a_1 - 4.0 * a_2
+    if disc >= 0:
+        root = np.sqrt(disc)
+        poles = f"real tau={2 * a_2 / (a_1 - root):.0f}s/{2 * a_2 / (a_1 + root):.0f}s"
+    else:
+        poles = f"complex zeta={a_1 / (2 * np.sqrt(a_2)):.3f} w_n={1 / np.sqrt(a_2) * 1e3:.3f}mrad/s"
+
+    model = pd.Series(evaluate(best.x), index=df.index)
+
+    resid_descent = residual(best.x)
+    low_mask = in_zone3 & np.isfinite(measured)
+    rmse_low = (float(np.sqrt(np.mean((model.values[low_mask] - measured[low_mask]) ** 2)))
+                if low_mask.sum() else float("nan"))
+
+    # Dip metrics: the whole point of the RHP zero is reproducing an excursion
+    # BELOW the cruise level, so report modeled vs. measured depth (positive =
+    # degC below the high-hold level) to show whether it landed. Two measured
+    # figures, because they differ a lot and only one is a fair comparison:
+    # the raw minimum is the bottom of a ~+/-4 degC periodic oscillation
+    # (visible sawtooth, same period as the POA irradiance ripple), whereas
+    # the TREND minimum is the actual excursion a smooth model can represent.
+    # Quoting the raw figure alone makes the fit look far worse than it is.
+    desc_idx = np.flatnonzero(in_descent)
+    trend = tout.rolling("15min", center=True, min_periods=1).mean().values
+    modeled_dip = float(t_high - model.values[desc_idx].min())
+    measured_dip = float(t_high - np.nanmin(measured[desc_idx]))
+    measured_dip_trend = float(t_high - np.nanmin(trend[desc_idx]))
+    dip_at_s = float(t_s[desc_idx][int(np.argmin(model.values[desc_idx]))] - high_end_s)
+    # Residual against the trend, alongside the oscillation's own RMS about
+    # that trend -- together these show how much of rmse_c is irreducible
+    # measurement ripple rather than model error.
+    rmse_trend = float(np.sqrt(np.nanmean((model.values[desc_idx] - trend[desc_idx]) ** 2)))
+    osc_rms = float(np.sqrt(np.nanmean((measured[desc_idx] - trend[desc_idx]) ** 2)))
+
+    return {
+        "model": model,
+        "t_z": t_z,
+        "a_1": a_1,
+        "a_2": a_2,
+        "poles": poles,
+        "ramp_s": delta_t / ramp_rate,
+        "t_high_c": float(t_high),
+        "t_low_c": float(t_low),
+        "descent_s": duration_s,
+        "rmse_c": float(np.sqrt(np.mean(resid_descent ** 2))),
+        "rmse_low_hold_c": rmse_low,
+        "n_descent": int(fit_mask.sum()),
+        "modeled_dip_c": modeled_dip,
+        "measured_dip_c": measured_dip,
+        "measured_dip_trend_c": measured_dip_trend,
+        "dip_at_s": dip_at_s,
+        "rmse_vs_trend_c": rmse_trend,
+        "oscillation_rms_c": osc_rms,
+    }
+
+
+# --------------------------------------------------------------------------
 # Main analysis
 # --------------------------------------------------------------------------
 def analyze(args: argparse.Namespace) -> pd.DataFrame:
@@ -1131,6 +1436,28 @@ def make_string1_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     if has_tout:
         ax2 = ax.twinx()
         ax2.plot(df.index, df["tout_c"], color="tab:brown", label="Fuselage Skin Temp (Tout Proxy)")
+        # Piecewise-linear target -> non-minimum-phase (RHP-zero) 2nd-order
+        # response, fit to this window's own Tout -- see
+        # fit_tout_piecewise_model() / _tout_nmp_response().
+        tout_fit = fit_tout_piecewise_model(df)
+        if tout_fit is not None:
+            ax2.plot(df.index, tout_fit["model"], color="tab:blue", linewidth=1.8,
+                     label=f"Tout 2nd-Order Model, RHP Zero "
+                           f"(T_z={tout_fit['t_z']:.0f}s, RMSE {tout_fit['rmse_c']:.2f} degC)")
+            print(f"  Tout model: PWL target {tout_fit['t_high_c']:.1f} -> {tout_fit['t_low_c']:.1f} degC "
+                  f"into a 2nd-order response with an RHP zero; descent fit over "
+                  f"{tout_fit['descent_s'] / 60.0:.0f} min, {tout_fit['n_descent']} samples")
+            print(f"    T_z={tout_fit['t_z']:.0f}s  poles: {tout_fit['poles']}  "
+                  f"target ramp T_r={tout_fit['ramp_s'] / 60.0:.1f} min")
+            print(f"    descent RMSE {tout_fit['rmse_c']:.2f} degC vs raw / "
+                  f"{tout_fit['rmse_vs_trend_c']:.2f} degC vs 15-min trend "
+                  f"(measurement ripple about that trend is {tout_fit['oscillation_rms_c']:.2f} degC, "
+                  f"irreducible); low-hold RMSE {tout_fit['rmse_low_hold_c']:.2f} degC "
+                  f"(not fit, out-of-sample)")
+            print(f"    inverse-response dip below cruise: modeled "
+                  f"{tout_fit['modeled_dip_c']:.1f} degC at +{tout_fit['dip_at_s'] / 60.0:.0f} min, "
+                  f"measured {tout_fit['measured_dip_trend_c']:.1f} degC on the trend "
+                  f"({tout_fit['measured_dip_c']:.1f} degC at the raw oscillation trough)")
         ax2.axhline(STC_TEMP_C, color="black", linewidth=0.8, linestyle=":", label=f"STC ({STC_TEMP_C:.0f} degC)")
         ax2.set_ylabel("Temp (degC)")
         ax.set_title("Environmentals", fontweight="bold")
