@@ -235,6 +235,44 @@ DEFAULT_ETFE_TRANSMISSION = round(_spectrally_weighted_etfe_transmission(), 4)  
 # above -- no spectral transmission chart was provided for it.
 DEFAULT_POE_TRANSMISSION = 0.92
 
+# ---- Cell electrical parameters for the string-1 cell-temperature estimator
+# (estimate_string1_cell_temperature()) ----
+#
+# CELL_VMPP_STC_V is the single most influential number in that estimator:
+# every 10 mV of anchor error is ~6-7 degC of cell-temperature bias (per-cell
+# beta is only ~1.6 mV/degC). The default is a nominal Maxeon Gen 7 figure and
+# has NOT been verified against the 546209 Rev C datasheet's Pe-bin Vmpp --
+# verify it, or better, use the low-hold self-calibration figure the estimator
+# prints and pass it back via --cell-vmpp-stc. Impp at STC is DERIVED as
+# (cell_efficiency x cell_area x 1000 W/m^2) / Vmpp so the current->irradiance
+# leg stays exactly consistent with how the rest of this script converts
+# irradiance to power, rather than introducing a second independent anchor.
+CELL_VMPP_STC_V = 0.66
+# Vmpp temperature coefficient. -0.236 %/degC is the user-supplied datasheet
+# figure -- but note the consistency question: Pmpp coeff (-0.27) minus an
+# Isc coeff (+0.05) implies beta_Vmpp ~ -0.32 %/degC, and -0.236 is the
+# classic Maxeon *Voc* coefficient. Both are plotted (primary + alternate)
+# so the spread between them reads directly as the calibration uncertainty.
+VMPP_TEMP_COEFF_PCT_PER_C = -0.236
+ISC_TEMP_COEFF_PCT_PER_C = +0.05     # weak, positive; only a correction term here
+DIODE_IDEALITY = 1.1                 # n for the n*kT/q ln(G) Vmpp-vs-irradiance term
+BOLTZMANN_OVER_Q_V_PER_K = 8.617333262e-5
+# Validity floors: below these the operating point is too far into the mushy
+# low-signal regime for the MPP model to mean anything (ln(G) blows up as
+# I -> 0, and Vmpp itself degrades at very low irradiance).
+CELL_TEMP_MIN_CURRENT_A = 0.3
+CELL_TEMP_MIN_VOLTAGE_V = 5.0
+# Flat-current clamp detector: genuine MPP tracking on this aircraft always
+# carries the attitude-oscillation ripple (several % over a couple of
+# minutes, same period as the POA ripple), so a stretch where current sits
+# dead-flat -- relative rolling std below this over the window -- is read as
+# the MPPT current-limiting / battery-full curtailment, NOT tracking. Off-MPP
+# samples ride toward Voc and would read as spuriously cold cells, so they
+# are masked. Heuristic: a curtailment mode that still lets current wander
+# a few % would slip through.
+CELL_TEMP_CLAMP_WINDOW_S = 120
+CELL_TEMP_CLAMP_REL_STD = 0.01
+
 GPS_TOPIC = "vehicle_gps_position"
 MPPT_TOPICS = ("/zeus/mppt_0", "/zeus/mppt_1")
 TEMP_TOPIC = "/zeus/temperature"
@@ -955,6 +993,191 @@ def fit_tout_piecewise_model(df: pd.DataFrame):
 
 
 # --------------------------------------------------------------------------
+# String-1 cell temperature, parsed out of the string's own Vmpp/Impp
+# --------------------------------------------------------------------------
+def estimate_string1_cell_temperature(df: pd.DataFrame, args: argparse.Namespace):
+    """Estimate string-1 CELL temperature from the string's own measured MPP
+    voltage and current -- independent of the fuselage thermocouple.
+
+    Why bother, given tout_c exists: the thermocouple is on the SIDE of the
+    fuselage, not at the wing-top cells. It sees different solar loading and
+    a different boundary layer, so it cannot stand in for cell temperature
+    even in principle -- the cells' own electrical signature is the only
+    onboard measurement OF the cells. String 1 only (user directive; also
+    the only sane choice -- string 0 rides the MPPT-12SBB's 8 V input floor,
+    where its voltage is converter-limited, not an MPP).
+
+    Why (G, T) is separable even though both drive the voltage: at the max
+    power point the sensitivities are strongly asymmetric --
+
+        Impp ~ Impp_stc * (G/G0) * (1 + alpha*(T-25))     alpha ~ +0.05 %/degC
+        Vmpp ~ N * [v_stc + n*(k*T_K/q)*ln(G/G0)
+                    + beta*(T-25)] - I*Rs                 beta  ~ -0.24..-0.32 %/degC
+
+    Current is nearly linear in G and nearly blind to T; voltage is strongly
+    linear in T and only logarithmic in G. So measured current pins G, and
+    voltage -- corrected by the ln(G) term -- reads T. Using MEASURED current
+    as the irradiance proxy (instead of the modeled clear-sky POA) makes the
+    estimator self-contained: clouds drop out entirely, because I measures
+    the irradiance the cells actually received. Solved per-sample by
+    fixed-point iteration on T; the contraction factor is ~|dRHS/dT| ~
+    (n*k/q * |ln g| + a*alpha) / |beta_abs| ~ 0.1-0.2, so a handful of
+    vectorized passes converges to well under 0.1 degC.
+
+    Error budget / knobs (all exposed, none silently trusted):
+      - Vmpp_stc anchor: THE dominant systematic. ~10 mV anchor error is
+        ~6-7 degC of bias, uniformly across the flight. The estimator prints
+        a "low-hold self-calibration" figure: the v_stc that would make the
+        low-hold mean cell temp equal the fuselage TC's mean there -- the
+        flight segment where cell-vs-TC disagreement should be smallest
+        (dense air, strong convection, weak late-day sun). Printed as a
+        diagnostic, NOT applied: equating them bakes in trust of the
+        side-mounted TC, which is exactly what this estimator exists to
+        avoid. Rerun with --cell-vmpp-stc to apply it deliberately.
+      - beta: both the user-supplied datasheet figure (--vmpp-temp-coeff,
+        default -0.236 %/degC) and the gamma-minus-alpha implied figure
+        (~-0.32 %/degC) are computed; the spread between the two output
+        traces IS the coefficient uncertainty, worn openly.
+      - Rs (--string1-rs-ohm, default 0): series resistance between cells
+        and the measurement point. At 58 cells, 0.2 ohm x 4 A ~ 14 mV/cell
+        ~ 9 degC, correlated with current (i.e. with irradiance). Default 0
+        means that bias is absorbed into the temperature trace; set a real
+        harness estimate to remove it.
+
+    Masks: low-signal floors (current/voltage/sun-up) plus the flat-current
+    clamp detector (see CELL_TEMP_CLAMP_* constants) -- curtailed samples sit
+    off-MPP toward Voc and would read as spuriously cold.
+
+    Adds columns to df (all NaN where masked): tc_string1_est_c (primary),
+    tc_string1_est_alt_c (gamma-alpha beta), g_cell_string1_w_m2 (effective
+    cell-plane irradiance implied by measured current -- includes
+    encapsulation and incidence, so compare against POA x encapsulation, not
+    bare POA). Returns a metadata dict for the plot/summary, or None if the
+    needed channels are absent.
+    """
+    if "pv_voltage_v_1" not in df.columns or "pv_current_a_1" not in df.columns:
+        print("  (note: no string-1 V/I channels in this log - skipping cell-temp estimate)")
+        return None
+
+    v_meas, i_meas = df["pv_voltage_v_1"], df["pv_current_a_1"]
+    n_cells = args.string1_cell_count
+    v_stc = args.cell_vmpp_stc
+    # Derived, not independent: keeps the current->G leg consistent with the
+    # script-wide irradiance->power conversion (see CELL_VMPP_STC_V comment).
+    i_mpp_stc = (args.cell_efficiency * args.cell_area_cm2 / 1e4 * STC_IRRADIANCE_W_M2) / v_stc
+    beta_pct_alt = POWER_TEMP_COEFF_PCT_PER_C - ISC_TEMP_COEFF_PCT_PER_C
+
+    valid = (
+        v_meas.notna() & i_meas.notna()
+        & (i_meas >= CELL_TEMP_MIN_CURRENT_A)
+        & (v_meas >= CELL_TEMP_MIN_VOLTAGE_V)
+        & (df["sun_elevation_deg"] > 0)
+    )
+    window = f"{CELL_TEMP_CLAMP_WINDOW_S:.0f}s"
+    i_roll_mean = i_meas.rolling(window, min_periods=30).mean()
+    i_roll_std = i_meas.rolling(window, min_periods=30).std()
+    rel_std = (i_roll_std / i_roll_mean).where(i_roll_mean > CELL_TEMP_MIN_CURRENT_A)
+    clamped = valid & (rel_std < CELL_TEMP_CLAMP_REL_STD)
+    use = (valid & ~clamped).values
+    if use.sum() < 10:
+        print("  (note: too few usable string-1 samples - skipping cell-temp estimate)")
+        return None
+
+    # Cell-level voltage: the string divides across N series cells, and the
+    # I*Rs harness drop means the cells sit HIGHER than the measured terminal
+    # voltage when current flows.
+    v_cell = (v_meas.values[use] + i_meas.values[use] * args.string1_rs_ohm) / n_cells
+    i_use = i_meas.values[use]
+
+    def solve(beta_pct: float):
+        beta_v_per_c = (beta_pct / 100.0) * v_stc          # absolute V/degC per cell, < 0
+        t_c = np.full(v_cell.shape, STC_TEMP_C)
+        g_ratio = None
+        for _ in range(8):                                  # contraction ~0.1-0.2/pass
+            a_v = DIODE_IDEALITY * BOLTZMANN_OVER_Q_V_PER_K * (t_c + 273.15)
+            g_ratio = (i_use / i_mpp_stc) / (
+                1.0 + (ISC_TEMP_COEFF_PCT_PER_C / 100.0) * (t_c - STC_TEMP_C))
+            t_c = STC_TEMP_C + (v_cell - v_stc - a_v * np.log(g_ratio)) / beta_v_per_c
+        return t_c, g_ratio
+
+    t_primary, g_ratio = solve(args.vmpp_temp_coeff)
+    t_alt, _ = solve(beta_pct_alt)
+
+    for col, values in (("tc_string1_est_c", t_primary),
+                         ("tc_string1_est_alt_c", t_alt),
+                         ("g_cell_string1_w_m2", g_ratio * STC_IRRADIANCE_W_M2)):
+        s = pd.Series(np.nan, index=df.index)
+        s.iloc[np.flatnonzero(use)] = values
+        df[col] = s
+
+    # Low-hold self-calibration diagnostic (see docstring): invert the model
+    # per-sample with T pinned to the fuselage TC, over the main low hold,
+    # and report the v_stc that assumption implies. v(T) = v_stc*(1 +
+    # beta_pct*(T-25)) + a(T)*ln(g) with beta_abs = beta_pct*v_stc, so
+    # v_stc = (v_cell - a*ln g) / (1 + beta_pct*(T-25)). g itself barely
+    # depends on v_stc (only through Impp_stc), so one pass is plenty.
+    hold = keep_main_hold(df)
+    calibration_v_stc = float("nan")
+    low = (hold["flight_phase"] == "holding_low") & hold["tc_string1_est_c"].notna() \
+        & hold["tout_c"].notna()
+    if low.any():
+        t_tc = hold.loc[low, "tout_c"].values
+        vc = (hold.loc[low, "pv_voltage_v_1"].values
+              + hold.loc[low, "pv_current_a_1"].values * args.string1_rs_ohm) / n_cells
+        a_v = DIODE_IDEALITY * BOLTZMANN_OVER_Q_V_PER_K * (t_tc + 273.15)
+        g_low = (hold.loc[low, "pv_current_a_1"].values / i_mpp_stc) / (
+            1.0 + (ISC_TEMP_COEFF_PCT_PER_C / 100.0) * (t_tc - STC_TEMP_C))
+        calibration_v_stc = float(np.nanmean(
+            (vc - a_v * np.log(g_low))
+            / (1.0 + (args.vmpp_temp_coeff / 100.0) * (t_tc - STC_TEMP_C))))
+
+    # Phase means + the delta-T-vs-irradiance slope, all as loose diagnostics.
+    result = {
+        "beta_pct": args.vmpp_temp_coeff,
+        "beta_pct_alt": beta_pct_alt,
+        "i_mpp_stc": i_mpp_stc,
+        "v_stc": v_stc,
+        "rs_ohm": args.string1_rs_ohm,
+        "n_cells": n_cells,
+        "pct_masked_signal": 100.0 * (~valid).sum() / len(df),
+        "pct_masked_clamp": 100.0 * clamped.sum() / len(df),
+        "calibration_v_stc": calibration_v_stc,
+    }
+    delta_t = df["tc_string1_est_c"] - df["tout_c"]
+    for phase_name in ("holding_high", "holding_low"):
+        m = (hold["flight_phase"] == phase_name) & hold["tc_string1_est_c"].notna()
+        if m.any():
+            result[f"{phase_name}_tc_c"] = float(hold.loc[m, "tc_string1_est_c"].mean())
+            result[f"{phase_name}_tout_c"] = float(hold.loc[m, "tout_c"].mean())
+    ok = delta_t.notna() & df["g_cell_string1_w_m2"].notna()
+    if ok.sum() > 100:
+        slope = np.polyfit(df.loc[ok, "g_cell_string1_w_m2"], delta_t[ok], 1)[0]
+        result["delta_t_per_kw_m2"] = float(slope * 1000.0)
+
+    print(f"  String 1 cell-temp estimate (from Vmpp/Impp): {n_cells} cells, "
+          f"Vmpp_stc {v_stc:.3f} V/cell, Impp_stc {i_mpp_stc:.2f} A")
+    print(f"    beta {args.vmpp_temp_coeff:.3f} %/degC (alt: gamma-alpha = {beta_pct_alt:.2f}), "
+          f"n_ideality {DIODE_IDEALITY}, Rs {args.string1_rs_ohm:.2f} ohm")
+    print(f"    masked: {result['pct_masked_signal']:.1f}% low-signal, "
+          f"{result['pct_masked_clamp']:.1f}% flat-current clamp suspected")
+    for phase_name, label in (("holding_high", "high hold"), ("holding_low", "low hold")):
+        if f"{phase_name}_tc_c" in result:
+            tc_mean = result[f"{phase_name}_tc_c"]
+            tout_mean = result[f"{phase_name}_tout_c"]
+            print(f"    {label} mean: cell {tc_mean:.1f} degC vs fuselage TC {tout_mean:.1f} "
+                  f"degC (delta {tc_mean - tout_mean:+.1f} -- TC is side-mounted, "
+                  f"differences are expected)")
+    if "delta_t_per_kw_m2" in result:
+        print(f"    delta-T vs cell-plane irradiance: {result['delta_t_per_kw_m2']:+.1f} degC per "
+              f"kW/m^2 (crude single-regressor slope)")
+    if np.isfinite(calibration_v_stc):
+        print(f"    low-hold self-calibration: Vmpp_stc that would put cell temp == fuselage TC "
+              f"there: {calibration_v_stc:.3f} V/cell (vs {v_stc:.3f} assumed; rerun with "
+              f"--cell-vmpp-stc {calibration_v_stc:.3f} to apply)")
+    return result
+
+
+# --------------------------------------------------------------------------
 # Main analysis
 # --------------------------------------------------------------------------
 def analyze(args: argparse.Namespace) -> pd.DataFrame:
@@ -1521,6 +1744,101 @@ def make_string1_pct_diff_plot(df: pd.DataFrame, out_path: Path, tz: str) -> Non
     print(f"Saved plot -> {out_path}")
 
 
+def make_string1_cell_temp_plot(df: pd.DataFrame, result: dict, out_path: Path,
+                                  tz: str, args: argparse.Namespace) -> None:
+    """Voltage-derived string-1 cell temperature (see
+    estimate_string1_cell_temperature()) against the fuselage TC, plus the
+    two legs that feed it: the current-implied cell-plane irradiance (vs the
+    modeled clear-sky expectation) and the cell-minus-TC temperature delta.
+
+    Panel layout:
+      1. Altitude + temperatures: fuselage TC (side-mounted -- NOT at the
+         cells) vs the estimate under both beta coefficients. The spread
+         between the two estimate traces is the coefficient uncertainty.
+         Raw estimate at low alpha with a rolling mean on top -- V/I sensor
+         noise divided by a ~1.6 mV/degC-per-cell slope is a few degC of
+         sample-to-sample chatter that the mean sees through.
+      2. Cell-plane irradiance implied by measured current vs modeled
+         clear-sky POA x encapsulation. Gaps between them are clouds (or
+         POA-model error) -- this is the leg that makes the estimator
+         immune to clouds, made visible.
+      3. Cell temp minus fuselage TC. Expected NONZERO and growing with
+         irradiance: the TC sits on the side of the fuselage in its own
+         solar/convective environment.
+
+    Same "zones 1-3" window and layout conventions as make_string1_plot().
+    """
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    local_index = df.index.tz_convert(tz)
+    df = df.set_axis(local_index)
+    df = keep_main_hold(df)
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10.5), sharex=True)
+
+    def legend_outside(ax, *extra_axes):
+        handles, labels = ax.get_legend_handles_labels()
+        for extra in extra_axes:
+            h, l = extra.get_legend_handles_labels()
+            handles += h
+            labels += l
+        ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.06, 1.0), borderaxespad=0.0)
+
+    tc_roll = df["tc_string1_est_c"].rolling("300s", min_periods=1).mean()
+
+    ax = axes[0]
+    ax.plot(df.index, df["alt_msl_m"], color="tab:purple", label="Altitude (MSL)")
+    ax.set_ylabel("Altitude MSL (m)")
+    ax2 = ax.twinx()
+    ax2.plot(df.index, df["tout_c"], color="tab:brown", alpha=0.8,
+             label="Fuselage Skin TC (side-mounted, not at the cells)")
+    ax2.plot(df.index, df["tc_string1_est_c"], color="tab:red", alpha=0.25, linewidth=0.6)
+    ax2.plot(df.index, tc_roll, color="tab:red", linewidth=1.6,
+             label=f"Cell Temp from Vmpp (beta {result['beta_pct']:.3f} %/degC, 5-min mean)")
+    ax2.axhline(STC_TEMP_C, color="black", linewidth=0.8, linestyle=":",
+                label=f"STC ({STC_TEMP_C:.0f} degC)")
+    ax2.set_ylabel("Temp (degC)")
+    ax.set_title("String 1: Voltage-Derived Cell Temperature", fontweight="bold")
+    legend_outside(ax, ax2)
+
+    ax = axes[1]
+    encapsulation = args.etfe_transmission * args.poe_transmission
+    ax.plot(df.index, df["poa_string1_w_m2"] * encapsulation, color="tab:red", alpha=0.6,
+            label="Modeled Clear-Sky POA x Encapsulation")
+    ax.plot(df.index, df["g_cell_string1_w_m2"], color="tab:green", linewidth=0.8,
+            label="Cell-Plane Irradiance Implied by Measured Current")
+    ax.set_ylabel("Irradiance (W/m^2)")
+    ax.set_title("String 1: Cell-Plane Irradiance -- Implied by Current vs Modeled Clear-Sky",
+                 fontweight="bold")
+    legend_outside(ax)
+
+    ax = axes[2]
+    shade_flight_phases([ax], df["flight_phase"])
+    delta_t = df["tc_string1_est_c"] - df["tout_c"]
+    center, half_width = rolling_band(delta_t, PCT_DIFF_ROLLING_WINDOW_S)
+    window_min = PCT_DIFF_ROLLING_WINDOW_S / 60.0
+    ax.fill_between(df.index, center - half_width, center + half_width,
+                     color="tab:red", alpha=0.15, zorder=1,
+                     label=f"{window_min:.0f}-min Rolling Std")
+    ax.plot(df.index, delta_t, color="tab:red", alpha=0.4, linewidth=0.6,
+            label="Cell Temp minus Fuselage TC")
+    ax.plot(df.index, center, color="black", linewidth=1.2,
+            label=f"{window_min:.0f}-min Rolling Mean")
+    ax.axhline(0.0, color="black", linewidth=0.8, linestyle=":",
+               label="0 (cell temp = fuselage TC)")
+    ax.set_ylabel("Delta T (degC)")
+    ax.set_title("String 1: Cell Temp minus Fuselage TC (side-mounted -- nonzero expected)",
+                 fontweight="bold")
+    legend_outside(ax)
+
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
+    axes[-1].set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved plot -> {out_path}")
+
+
 def make_strings_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     """Per-MPPT-string voltage and current, one line per string with a
     consistent color across both panels. Separate from make_plot()'s summed
@@ -1823,6 +2141,22 @@ def main() -> None:
                          help="Fractional light transmission through the POE encapsulant "
                               "(stacks with --etfe-transmission -- see docstring). Flat figure, "
                               f"not spectrally-weighted. Always applied. Default {DEFAULT_POE_TRANSMISSION:.2f}.")
+    parser.add_argument("--cell-vmpp-stc", type=float, default=CELL_VMPP_STC_V,
+                         help="Per-cell Vmpp at STC [V], the anchor for the string-1 "
+                              "cell-temperature estimate. THE dominant systematic there "
+                              "(~10 mV ~ 6-7 degC of bias) -- verify against the Maxeon "
+                              "546209 Rev C Pe-bin figure, or use the low-hold "
+                              f"self-calibration value the run prints. Default {CELL_VMPP_STC_V}.")
+    parser.add_argument("--vmpp-temp-coeff", type=float, default=VMPP_TEMP_COEFF_PCT_PER_C,
+                         help="Vmpp temperature coefficient [%%/degC, negative] for the "
+                              "string-1 cell-temperature estimate. The alternate "
+                              "gamma-minus-alpha figure (~-0.32) is always computed alongside "
+                              f"for comparison. Default {VMPP_TEMP_COEFF_PCT_PER_C}.")
+    parser.add_argument("--string1-rs-ohm", type=float, default=0.0,
+                         help="String-1 series (harness) resistance [ohm] between the cells "
+                              "and the MPPT's measurement point. Default 0, which folds any "
+                              "real I*Rs drop into the cell-temperature estimate as a "
+                              "current-correlated bias (~9 degC per 0.2 ohm at 4 A).")
     parser.add_argument("--gps-tolerance-s", type=float, default=2.0,
                          help="Max time gap allowed when matching a GPS fix to an MPPT sample")
     parser.add_argument("--mppt-sync-tolerance-s", type=float, default=0.5,
@@ -1860,6 +2194,11 @@ def main() -> None:
     tz = args.tz or detect_launch_timezone(df["lat"].iloc[0], df["lon"].iloc[0])
     print_summary(df, args, tz)
 
+    # String-1 cell temperature from the string's own Vmpp/Impp (independent
+    # of the side-mounted fuselage TC) -- adds tc_string1_est_c etc. to df,
+    # so it must run before the CSV export below picks up columns.
+    cell_temp = estimate_string1_cell_temperature(df, args)
+
     ulog_path = Path(args.ulog)
     out_dir = Path(args.output_dir) if args.output_dir else ulog_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1873,6 +2212,8 @@ def main() -> None:
         *(["tout_c"] if "tout_c" in df.columns else []),
         *[c for c in df.columns if c.startswith("pv_")],
         *(["temp_derate_factor"] if "temp_derate_factor" in df.columns else []),
+        *(["tc_string1_est_c", "tc_string1_est_alt_c", "g_cell_string1_w_m2"]
+          if "tc_string1_est_c" in df.columns else []),
         "pre_mppt_efficiency_pct",
         *(["pre_mppt_efficiency_string1_pct"] if "pre_mppt_efficiency_string1_pct" in df.columns else []),
     ]
@@ -1905,6 +2246,12 @@ def main() -> None:
             make_string1_pct_diff_plot(df, pct_diff_plot_path, tz)
             if not args.no_open:
                 open_in_vscode(pct_diff_plot_path)
+
+            if cell_temp is not None:
+                cell_temp_plot_path = out_dir / f"{stem}_string1_cell_temp.png"
+                make_string1_cell_temp_plot(df, cell_temp, cell_temp_plot_path, tz, args)
+                if not args.no_open:
+                    open_in_vscode(cell_temp_plot_path)
 
             print("Sweeping String 1 panel-normal angle (90-105 deg, 0.05 deg steps) ...")
             sweep = sweep_panel_normal_angle(df, args, angle_min_deg=90.0, angle_max_deg=105.0,
