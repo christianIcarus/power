@@ -275,6 +275,15 @@ CELL_TEMP_MIN_VOLTAGE_V = 5.0
 # a few % would slip through.
 CELL_TEMP_CLAMP_WINDOW_S = 120
 CELL_TEMP_CLAMP_REL_STD = 0.01
+# Post-solve off-MPP guard + physics gates. The clamp detector above catches
+# SUSTAINED curtailment; these catch transient tracker excursions and results
+# that cannot be temperatures. Samples failing a gate are refilled by carrying
+# the last accepted estimate forward (LOCF / zero-order hold) up to
+# CELL_TEMP_HOLD_MAX_S, then dropped to NaN rather than trusting a stale hold.
+CELL_TEMP_OFFMPP_GUARD_V = 1.0        # string V this far below rolling median = off-MPP ride
+CELL_TEMP_MAX_PLAUSIBLE_C = 85.0      # near POE lamination temps -- not a flight temperature
+CELL_TEMP_MIN_DELTA_VS_TOUT_C = -5.0  # illuminated cells can't sit far below ambient
+CELL_TEMP_HOLD_MAX_S = 120
 
 GPS_TOPIC = "vehicle_gps_position"
 MPPT_TOPICS = ("/zeus/mppt_0", "/zeus/mppt_1")
@@ -1049,14 +1058,21 @@ def estimate_string1_cell_temperature(df: pd.DataFrame, args: argparse.Namespace
 
     Masks: low-signal floors (current/voltage/sun-up) plus the flat-current
     clamp detector (see CELL_TEMP_CLAMP_* constants) -- curtailed samples sit
-    off-MPP toward Voc and would read as spuriously cold.
+    off-MPP toward Voc and would read as spuriously cold. After the solve, an
+    off-MPP voltage guard and physics gates (CELL_TEMP_OFFMPP_GUARD_V /
+    _MAX_PLAUSIBLE_C / _MIN_DELTA_VS_TOUT_C) reject transient tracker
+    excursions and non-thermal results; gated samples are refilled by
+    last-observation-carried-forward (zero-order hold) up to
+    CELL_TEMP_HOLD_MAX_S and dropped beyond it.
 
     Adds columns to df (all NaN where masked): tc_string1_est_c (primary),
     tc_string1_est_alt_c (gamma-alpha beta), g_cell_string1_w_m2 (effective
     cell-plane irradiance implied by measured current -- includes
     encapsulation and incidence, so compare against POA x encapsulation, not
-    bare POA). Returns a metadata dict for the plot/summary, or None if the
-    needed channels are absent.
+    bare POA), tc_string1_held (bool: sample is an LOCF hold, not a fresh
+    estimate -- excluded from the self-calibration/diagnostics). Returns a
+    metadata dict for the plot/summary, or None if the needed channels are
+    absent.
     """
     if "pv_voltage_v_1" not in df.columns or "pv_current_a_1" not in df.columns:
         print("  (note: no string-1 V/I channels in this log - skipping cell-temp estimate)")
@@ -1106,12 +1122,57 @@ def estimate_string1_cell_temperature(df: pd.DataFrame, args: argparse.Namespace
     t_primary, g_ratio = solve(args.vmpp_temp_coeff)
     t_alt, _ = solve(beta_pct_alt)
 
+    # Full-length series (NaN off-mask) so the gates below get rolling /
+    # cross-column context.
+    series = {}
     for col, values in (("tc_string1_est_c", t_primary),
                          ("tc_string1_est_alt_c", t_alt),
                          ("g_cell_string1_w_m2", g_ratio * STC_IRRADIANCE_W_M2)):
         s = pd.Series(np.nan, index=df.index)
         s.iloc[np.flatnonzero(use)] = values
-        df[col] = s
+        series[col] = s
+
+    # ---- Post-solve off-MPP guard + physics gates ----
+    # The flat-current clamp detector catches SUSTAINED curtailment but not
+    # transient off-MPP rides (the tracker chasing fast irradiance ripple):
+    # those sit low in voltage / high in current and read as spuriously HOT
+    # cells (the +50..+100 degC spikes).
+    #   1. Off-MPP voltage guard: string V more than CELL_TEMP_OFFMPP_GUARD_V
+    #      below its own rolling median. Genuine Vmpp motion over the window
+    #      (ln(G) + real temperature change) is a few hundred mV; documented
+    #      off-MPP spikes are ~-2.8 V. (A P-vs-G envelope gate would be
+    #      redundant here: G is inferred from I, so P/G ~ V and the V guard
+    #      already covers it.)
+    #   2. Self-evidently non-thermal results: T above
+    #      CELL_TEMP_MAX_PLAUSIBLE_C, or further below the fuselage TC than
+    #      CELL_TEMP_MIN_DELTA_VS_TOUT_C while illuminated (off-MPP-toward-Voc
+    #      signature, e.g. curtailment the clamp detector missed).
+    # Gated samples are refilled by last-observation-carried-forward (LOCF /
+    # zero-order hold) up to CELL_TEMP_HOLD_MAX_S so brief tracker excursions
+    # don't punch holes in the trace; longer gated stretches go NaN rather
+    # than trusting a stale hold. tc_string1_held marks the held samples --
+    # their V/I are the contaminated values, so they are excluded from the
+    # self-calibration and diagnostic statistics below.
+    t_ser = series["tc_string1_est_c"]
+    v_roll_med = v_meas.rolling(window, min_periods=30).median()
+    gate_offmpp = ((v_roll_med - v_meas) > CELL_TEMP_OFFMPP_GUARD_V) & t_ser.notna()
+    gate_hot = t_ser > CELL_TEMP_MAX_PLAUSIBLE_C
+    if "tout_c" in df.columns:
+        gate_cold = (t_ser - df["tout_c"]) < CELL_TEMP_MIN_DELTA_VS_TOUT_C
+    else:
+        gate_cold = pd.Series(False, index=df.index)
+    gated = (gate_offmpp | gate_hot | gate_cold) & t_ser.notna()
+
+    dt_med_s = np.nanmedian(np.diff(df.index.asi8)) / 1e9
+    hold_limit = max(1, int(round(CELL_TEMP_HOLD_MAX_S / max(dt_med_s, 1e-3))))
+    held = pd.Series(False, index=df.index)
+    for col, s in series.items():
+        filled = s.where(~gated).ffill(limit=hold_limit)
+        out = s.where(~gated, filled)
+        if col == "tc_string1_est_c":
+            held = (gated & out.notna()).fillna(False)
+        df[col] = out
+    df["tc_string1_held"] = held
 
     # Low-hold self-calibration diagnostic (see docstring): invert the model
     # per-sample with T pinned to the fuselage TC, over the main low hold,
@@ -1122,7 +1183,7 @@ def estimate_string1_cell_temperature(df: pd.DataFrame, args: argparse.Namespace
     hold = keep_main_hold(df)
     calibration_v_stc = float("nan")
     low = (hold["flight_phase"] == "holding_low") & hold["tc_string1_est_c"].notna() \
-        & hold["tout_c"].notna()
+        & ~hold["tc_string1_held"] & hold["tout_c"].notna()
     if low.any():
         t_tc = hold.loc[low, "tout_c"].values
         vc = (hold.loc[low, "pv_voltage_v_1"].values
@@ -1144,15 +1205,20 @@ def estimate_string1_cell_temperature(df: pd.DataFrame, args: argparse.Namespace
         "n_cells": n_cells,
         "pct_masked_signal": 100.0 * (~valid).sum() / len(df),
         "pct_masked_clamp": 100.0 * clamped.sum() / len(df),
+        "pct_gate_offmpp": 100.0 * gate_offmpp.sum() / len(df),
+        "pct_gate_nonphysical": 100.0 * ((gate_hot | gate_cold) & t_ser.notna()).sum() / len(df),
+        "pct_held": 100.0 * held.sum() / len(df),
+        "pct_gate_dropped": 100.0 * (gated & ~held).sum() / len(df),
         "calibration_v_stc": calibration_v_stc,
     }
     delta_t = df["tc_string1_est_c"] - df["tout_c"]
     for phase_name in ("holding_high", "holding_low"):
-        m = (hold["flight_phase"] == phase_name) & hold["tc_string1_est_c"].notna()
+        m = (hold["flight_phase"] == phase_name) & hold["tc_string1_est_c"].notna() \
+            & ~hold["tc_string1_held"]
         if m.any():
             result[f"{phase_name}_tc_c"] = float(hold.loc[m, "tc_string1_est_c"].mean())
             result[f"{phase_name}_tout_c"] = float(hold.loc[m, "tout_c"].mean())
-    ok = delta_t.notna() & df["g_cell_string1_w_m2"].notna()
+    ok = delta_t.notna() & df["g_cell_string1_w_m2"].notna() & ~df["tc_string1_held"]
     if ok.sum() > 100:
         slope = np.polyfit(df.loc[ok, "g_cell_string1_w_m2"], delta_t[ok], 1)[0]
         result["delta_t_per_kw_m2"] = float(slope * 1000.0)
@@ -1163,6 +1229,10 @@ def estimate_string1_cell_temperature(df: pd.DataFrame, args: argparse.Namespace
           f"n_ideality {DIODE_IDEALITY}, Rs {args.string1_rs_ohm:.2f} ohm")
     print(f"    masked: {result['pct_masked_signal']:.1f}% low-signal, "
           f"{result['pct_masked_clamp']:.1f}% flat-current clamp suspected")
+    print(f"    gated: {result['pct_gate_offmpp']:.1f}% off-MPP voltage guard, "
+          f"{result['pct_gate_nonphysical']:.1f}% non-physical result "
+          f"(LOCF-held {result['pct_held']:.1f}%, dropped {result['pct_gate_dropped']:.1f}% "
+          f"beyond the {CELL_TEMP_HOLD_MAX_S:.0f}s hold cap)")
     for phase_name, label in (("holding_high", "high hold"), ("holding_low", "low hold")):
         if f"{phase_name}_tc_c" in result:
             tc_mean = result[f"{phase_name}_tc_c"]
@@ -2215,7 +2285,7 @@ def main() -> None:
         *(["tout_c"] if "tout_c" in df.columns else []),
         *[c for c in df.columns if c.startswith("pv_")],
         *(["temp_derate_factor"] if "temp_derate_factor" in df.columns else []),
-        *(["tc_string1_est_c", "tc_string1_est_alt_c", "g_cell_string1_w_m2"]
+        *(["tc_string1_est_c", "tc_string1_est_alt_c", "g_cell_string1_w_m2", "tc_string1_held"]
           if "tc_string1_est_c" in df.columns else []),
         "pre_mppt_efficiency_pct",
         *(["pre_mppt_efficiency_string1_pct"] if "pre_mppt_efficiency_string1_pct" in df.columns else []),
