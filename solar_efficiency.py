@@ -240,21 +240,23 @@ DEFAULT_POE_TRANSMISSION = 0.92
 #
 # CELL_VMPP_STC_V is the single most influential number in that estimator:
 # every 10 mV of anchor error is ~6-7 degC of cell-temperature bias (per-cell
-# beta is only ~1.6 mV/degC). The default is a nominal Maxeon Gen 7 figure and
-# has NOT been verified against the 546209 Rev C datasheet's Pe-bin Vmpp --
-# verify it, or better, use the low-hold self-calibration figure the estimator
-# prints and pass it back via --cell-vmpp-stc. Impp at STC is DERIVED as
+# beta is only ~1.6 mV/degC). 0.647 is the midpoint of the 546209 Rev C
+# datasheet's Pe-bin Vmpp range (0.645-0.649 V, 5th/95th percentile flash
+# values -- user, 2026-08-30). Cell-to-cell binning spread and MPPT telemetry
+# offset are NOT covered by the datasheet; the low-hold self-calibration
+# figure the estimator prints absorbs both -- pass it back via
+# --cell-vmpp-stc to apply. Impp at STC is DERIVED as
 # (cell_efficiency x cell_area x 1000 W/m^2) / Vmpp so the current->irradiance
 # leg stays exactly consistent with how the rest of this script converts
 # irradiance to power, rather than introducing a second independent anchor.
-CELL_VMPP_STC_V = 0.66
-# Vmpp temperature coefficient. -0.236 %/degC is the user-supplied datasheet
-# figure -- but note the consistency question: Pmpp coeff (-0.27) minus an
-# Isc coeff (+0.05) implies beta_Vmpp ~ -0.32 %/degC, and -0.236 is the
-# classic Maxeon *Voc* coefficient. Both are plotted (primary + alternate)
+CELL_VMPP_STC_V = 0.647
+# Vmpp temperature coefficient. -0.236 %/degC is the 546209 Rev C datasheet
+# figure (labeled just "Voltage" there, Voc vs Vmpp unspecified) -- but note
+# the consistency question: Pmpp coeff (-0.27) minus the Isc coeff (+0.058)
+# implies beta_Vmpp ~ -0.33 %/degC. Both are plotted (primary + alternate)
 # so the spread between them reads directly as the calibration uncertainty.
 VMPP_TEMP_COEFF_PCT_PER_C = -0.236
-ISC_TEMP_COEFF_PCT_PER_C = +0.05     # weak, positive; only a correction term here
+ISC_TEMP_COEFF_PCT_PER_C = +0.058    # 546209 Rev C "Current" coeff; weak, positive correction term
 DIODE_IDEALITY = 1.1                 # n for the n*kT/q ln(G) Vmpp-vs-irradiance term
 BOLTZMANN_OVER_Q_V_PER_K = 8.617333262e-5
 # Validity floors: below these the operating point is too far into the mushy
