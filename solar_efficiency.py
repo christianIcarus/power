@@ -183,7 +183,8 @@ POWER_TEMP_COEFF_PCT_PER_C = -0.27   # informational, not applied by default
 STC_TEMP_C = 25.0
 STC_IRRADIANCE_W_M2 = 1000.0
 
-# Genasun MPPT-12SBB datasheet input voltage window.
+# Packet Digital MPPT-12SBB datasheet input voltage window (buck-boost,
+# DroneCAN telemetry -- the /zeus/mppt_* topics carry its 1 Hz Stream message).
 MPPT_12SBB_VIN_MIN_V = 8.0
 MPPT_12SBB_VIN_MAX_V = 51.0
 
