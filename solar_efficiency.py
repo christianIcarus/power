@@ -1817,6 +1817,100 @@ def make_string1_pct_diff_plot(df: pd.DataFrame, out_path: Path, tz: str) -> Non
     print(f"Saved plot -> {out_path}")
 
 
+def make_pct_diff_attitude_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
+    """Roll rate vs the VARIATION of string 1's % Difference (measured vs
+    estimated power) -- the attitude sensitivity of the power model, made
+    visible.
+
+    Why roll RATE rather than roll angle: the estimated power already
+    compensates attitude through the incidence model, so a steady bank is
+    modeled fine and should produce no mismatch at all. What actually moves
+    with the mismatch variation is the TRANSITIONS -- attitude/MPPT
+    timestamp skew, and the tracker chasing a fast-moving operating point
+    through turns (flight 00007: Spearman rho +0.70 overall and +0.73 in
+    the high hold, vs +0.43 overall for roll angle).
+
+    Panels (same "zones 1-3" window as the other string-1 plots):
+      1. |roll rate| (1-s means, with a centered 30-s mean on top).
+      2. Centered 30-s rolling std of the % difference, time-aligned --
+         turn clusters in panel 1 line up with variation bumps here.
+      3. Scatter of the two on 30-s bins, with overall and per-phase
+         Spearman rank correlations. Late low-hold bins inflate as the
+         estimated power (the % denominator) fades toward dusk, so the
+         high-hold figure is the cleanest of the three.
+    """
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    if "roll_deg" not in df.columns or df["roll_deg"].isna().all():
+        print("  (note: no attitude data - skipping the pct-diff-vs-attitude plot)")
+        return
+
+    local_index = df.index.tz_convert(tz)
+    df = df.set_axis(local_index)
+    df = keep_main_hold(df)
+    pct_diff = df["pre_mppt_efficiency_string1_pct"] - 100.0
+
+    # 1-s means for a sane rate estimate, 30-s bins for the correlation.
+    r = pd.DataFrame({"roll_deg": df["roll_deg"], "pct_diff": pct_diff}).resample("1s").mean()
+    r["roll_rate"] = r["roll_deg"].diff().abs()
+    bins = pd.DataFrame({
+        "roll_rate": r["roll_rate"].resample("30s").mean(),
+        "pd_std": r["pct_diff"].resample("30s").std(),
+        "phase": df["flight_phase"].resample("30s").first(),
+    }).dropna()
+    if len(bins) < 20:
+        print("  (note: too few usable bins - skipping the pct-diff-vs-attitude plot)")
+        return
+
+    def spearman(g: pd.DataFrame) -> float:
+        return float(g["roll_rate"].rank().corr(g["pd_std"].rank()))
+
+    rho_lines = [f"Spearman rho overall = {spearman(bins):+.2f}"]
+    for phase_name in ("holding_high", "descending", "holding_low"):
+        g = bins[bins["phase"] == phase_name]
+        if len(g) >= 10:
+            rho_lines.append(f"{phase_name.replace('_', ' ')}: {spearman(g):+.2f}")
+
+    # Centered windows: a trailing window would phase-shift the smoothed
+    # traces and manufacture a fake lead/lag between the two panels.
+    rate_smooth = r["roll_rate"].rolling(30, min_periods=10, center=True).mean()
+    pd_std_ts = r["pct_diff"].rolling(30, min_periods=10, center=True).std()
+
+    fig = plt.figure(figsize=(12.5, 10))
+    gs = fig.add_gridspec(3, 5, height_ratios=[1, 1, 1.35], hspace=0.5, wspace=0.3)
+    ax_rate = fig.add_subplot(gs[0, :])
+    ax_var = fig.add_subplot(gs[1, :], sharex=ax_rate)
+    ax_scatter = fig.add_subplot(gs[2, 0:3])
+
+    shade_flight_phases([ax_rate, ax_var], df["flight_phase"])
+
+    ax_rate.plot(r.index, r["roll_rate"], color="tab:blue", linewidth=0.6, alpha=0.3)
+    ax_rate.plot(rate_smooth.index, rate_smooth, color="tab:blue", linewidth=1.6)
+    ax_rate.set_ylabel("|Roll Rate| (deg/s)")
+    ax_rate.set_title("String 1: Roll Rate (1-s, with Centered 30-s Mean)", fontweight="bold")
+    plt.setp(ax_rate.get_xticklabels(), visible=False)
+
+    ax_var.plot(pd_std_ts.index, pd_std_ts, color="tab:brown", linewidth=1.0)
+    ax_var.set_ylabel("Std of % Diff (30-s)")
+    ax_var.set_title("String 1: Variation of % Difference, Measured vs Estimated Power "
+                     "(Centered 30-s Rolling Std)", fontweight="bold")
+    ax_var.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
+    ax_var.set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
+
+    ax_scatter.scatter(bins["roll_rate"], bins["pd_std"], s=22, color="tab:blue",
+                       alpha=0.45, edgecolors="none")
+    ax_scatter.set_xlabel("|Roll Rate| (deg/s, 30-s mean)")
+    ax_scatter.set_ylabel("Std of % Diff (%, 30-s)")
+    ax_scatter.set_title("Mismatch Variation vs Roll Rate, 30-s Bins", fontweight="bold")
+    ax_scatter.text(1.08, 0.92, "\n".join(rho_lines), transform=ax_scatter.transAxes,
+                    ha="left", va="top", fontsize=10.5, linespacing=1.7)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved plot -> {out_path}")
+
+
 def make_string1_cell_temp_plot(df: pd.DataFrame, result: dict, out_path: Path,
                                   tz: str, args: argparse.Namespace) -> None:
     """Voltage-derived string-1 cell temperature (see
@@ -2319,6 +2413,11 @@ def main() -> None:
             make_string1_pct_diff_plot(df, pct_diff_plot_path, tz)
             if not args.no_open:
                 open_in_vscode(pct_diff_plot_path)
+
+            pctdiff_attitude_plot_path = out_dir / f"{stem}_string1_pctdiff_attitude.png"
+            make_pct_diff_attitude_plot(df, pctdiff_attitude_plot_path, tz)
+            if not args.no_open and pctdiff_attitude_plot_path.exists():
+                open_in_vscode(pctdiff_attitude_plot_path)
 
             if cell_temp is not None:
                 cell_temp_plot_path = out_dir / f"{stem}_string1_cell_temp.png"
