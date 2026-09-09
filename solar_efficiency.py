@@ -167,6 +167,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import plot_style
 import pvlib
 from pyulog import ULog
 from timezonefinder import TimezoneFinder
@@ -1561,7 +1562,7 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
             h, l = extra.get_legend_handles_labels()
             handles += h
             labels += l
-        ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.06, 1.0), borderaxespad=0.0)
+        ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.14, 1.0), borderaxespad=0.0)
 
     ax = axes[0]
     ax.plot(df.index, df["alt_msl_m"], color="tab:purple", label="Altitude (MSL)")
@@ -1623,7 +1624,7 @@ def make_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     legend_outside(ax)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
-    axes[-1].set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
+    axes[-1].set_xlabel(f"Local time, {plot_style.label(tz)} ({df.index[0].date()})")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved plot -> {out_path}")
@@ -1724,7 +1725,7 @@ def make_string1_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
             h, l = extra.get_legend_handles_labels()
             handles += h
             labels += l
-        ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.06, 1.0), borderaxespad=0.0)
+        ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.14, 1.0), borderaxespad=0.0)
 
     ax = axes[0]
     ax.plot(df.index, df["alt_msl_m"], color="tab:purple", label="Altitude (MSL)")
@@ -1786,7 +1787,7 @@ def make_string1_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     legend_outside(ax)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
-    axes[-1].set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
+    axes[-1].set_xlabel(f"Local time, {plot_style.label(tz)} ({df.index[0].date()})")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved plot -> {out_path}")
@@ -1811,7 +1812,7 @@ def make_string1_pct_diff_plot(df: pd.DataFrame, out_path: Path, tz: str) -> Non
     plot_pct_diff_panel(ax, df, show_band=False)
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
-    ax.set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
+    ax.set_xlabel(f"Local time, {plot_style.label(tz)} ({df.index[0].date()})")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved plot -> {out_path}")
@@ -1856,7 +1857,7 @@ def make_string1_cell_temp_plot(df: pd.DataFrame, result: dict, out_path: Path,
             h, l = extra.get_legend_handles_labels()
             handles += h
             labels += l
-        ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.06, 1.0), borderaxespad=0.0)
+        ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.14, 1.0), borderaxespad=0.0)
 
     tc_roll = df["tc_string1_est_c"].rolling("300s", min_periods=1).mean()
 
@@ -1906,7 +1907,7 @@ def make_string1_cell_temp_plot(df: pd.DataFrame, result: dict, out_path: Path,
     legend_outside(ax)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
-    axes[-1].set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
+    axes[-1].set_xlabel(f"Local time, {plot_style.label(tz)} ({df.index[0].date()})")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved plot -> {out_path}")
@@ -1959,7 +1960,7 @@ def make_strings_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     legend_outside(ax)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
-    axes[-1].set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
+    axes[-1].set_xlabel(f"Local time, {plot_style.label(tz)} ({df.index[0].date()})")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved plot -> {out_path}")
@@ -1989,7 +1990,7 @@ def make_poa_strings_plot(df: pd.DataFrame, out_path: Path, tz: str) -> None:
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
 
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=df.index.tz))
-    ax.set_xlabel(f"Local time, {tz} ({df.index[0].date()})")
+    ax.set_xlabel(f"Local time, {plot_style.label(tz)} ({df.index[0].date()})")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved plot -> {out_path}")
@@ -2124,7 +2125,7 @@ def make_normal_sweep_plot(df: pd.DataFrame, sweep: pd.DataFrame, out_path: Path
                               f"(Assumed Normal, {assumed_theta:.2f} deg)")
     ax_ts.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
     ax_ts.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=ts.index.tz))
-    ax_ts.set_xlabel(f"Local time, {tz} ({ts.index[0].date()})")
+    ax_ts.set_xlabel(f"Local time, {plot_style.label(tz)} ({ts.index[0].date()})")
 
     ax_sweep.plot(sweep.index, sweep["mean_rolling_std"], color="tab:brown", marker=".", markersize=3)
     ax_sweep.axvline(assumed_theta, color="black", linewidth=0.8, linestyle="--",
@@ -2148,7 +2149,7 @@ def make_normal_sweep_plot(df: pd.DataFrame, sweep: pd.DataFrame, out_path: Path
                                    f"(Optimized Normal, {min_theta:.2f} deg)")
         ax_opt.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
         ax_opt.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=ts.index.tz))
-        ax_opt.set_xlabel(f"Local time, {tz} ({ts.index[0].date()})")
+        ax_opt.set_xlabel(f"Local time, {plot_style.label(tz)} ({ts.index[0].date()})")
 
         # Same y-axis on both % Difference panels (assumed vs. optimized) so
         # they're directly comparable at a glance -- otherwise each
@@ -2294,6 +2295,7 @@ def main() -> None:
     print(f"Saved data -> {csv_path}")
 
     if not args.no_plot:
+        plot_style.apply()   # seaborn whitegrid at cmr10 -- see plot_style.py
         plot_path = out_dir / f"{stem}_solar_efficiency.png"
         make_plot(df, plot_path, tz)
         if not args.no_open:
