@@ -40,13 +40,16 @@ each one a further loss on top of the last (see "Panel incidence angle",
 
     P_bare(t)        = POA_irradiance(t) [W/m^2] * total_cell_area [m^2] * cell_efficiency
     P_no_temp_derate(t) = P_bare(t) * etfe_transmission * poe_transmission
+                                       * spectral_mismatch_m(t)
     P_estimated(t) = P_no_temp_derate(t) [* temp_derate_factor(t)]
 
 P_bare is the cell nameplate ceiling with nothing between the sun and the
 cells -- not physically real for this array, but a useful "no losses at
 all" reference. P_no_temp_derate adds the encapsulation stack's light loss
-(ETFE cover + POE encapsulant, both always applied, not opt-in) and is what
-"efficiency" is actually measured against when --apply-temp-derate is off.
+(ETFE cover + POE encapsulant, both always applied, not opt-in) AND the
+spectral mismatch factor M (also always applied -- see "Spectral mismatch"
+below), and is what "efficiency" is actually measured against when
+--apply-temp-derate is off.
 P_estimated is the final number used everywhere once temp derating is
 added on top.
 
@@ -134,6 +137,25 @@ POE_TRANSMISSION (0.92) is a single flat figure (user-supplied, 2026-08-25)
 weighted against the cell's response. Override with --poe-transmission if
 a spectral curve for it ever shows up and is worth digitizing the same way.
 
+Spectral mismatch M (always applied, NOT opt-in -- see
+compute_spectral_mismatch()): cell_efficiency is a 25.4% rating measured
+against the AM1.5G spectrum. Climbing does not just scale that spectrum up,
+it changes its SHAPE -- Rayleigh goes as lambda^-4, and the H2O bands at
+1380/1870 nm thin out with the water column. Those bands sit PAST the Max7's
+~1190 nm cutoff, so reopening them adds broadband irradiance the cell cannot
+convert, and a broadband POA therefore over-states available power by more
+and more as the aircraft climbs. M = U(actual)/U(AM1.5G) with
+U = integral(E*SR)/integral(E) corrects exactly that, from SPECTRL2 spectra
+at the aircraft's own ISA pressure and the MEASURED Max7 EQE (max7_eqe.csv).
+It is a LOSS, not a gain: ~0.999 at sea level falling to ~0.911 at 55 kft.
+
+M STACKS with the encapsulation factors, it does not replace them. M is a
+ratio with the same SR top and bottom, so a wavelength-flat laminate
+transmission cancels out of it exactly -- injecting a flat 0.8586 into SR
+moves M by 0.00%. Only the laminate's spectral tilt survives (-0.18% for POE
+uv-through, -0.78% for uv-cut, at 55 kft), so the ~14% the laminate actually
+absorbs is not in M and must still be applied separately.
+
 Temperature derating (Tout proxy, opt-in via --apply-temp-derate):
 No field literally named "Tout"/"OAT" exists in this log. Considered and
 rejected: /zeus/aeroprobe.temp_external_c (dead sentinel 999.0 for the whole
@@ -168,6 +190,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pvlib
+import spectral_mismatch as sm
 from pyulog import ULog
 from timezonefinder import TimezoneFinder
 
@@ -235,6 +258,49 @@ DEFAULT_ETFE_TRANSMISSION = round(_spectrally_weighted_etfe_transmission(), 4)  
 # figure (user-supplied, 2026-08-25), not spectrally-weighted like ETFE
 # above -- no spectral transmission chart was provided for it.
 DEFAULT_POE_TRANSMISSION = 0.92
+
+# Measured Max7 external QE, the input to the spectral mismatch factor M.
+# Bare cell, NOT laminated -- see spectral_mismatch.load_spectral_response()
+# for why that is the right input on both the M and the absolute-current legs.
+DEFAULT_EQE_CSV = Path(__file__).with_name("max7_eqe.csv")
+
+
+def compute_spectral_mismatch(alt_m, sun_elevation_deg, dayofyear, eqe_path):
+    """Per-sample M, plus a flag for samples past SPECTRL2's trusted zenith.
+
+    M = U(actual) / U(AM1.5G), U = integral(E*SR) / integral(E): the share of
+    broadband irradiance this cell can actually convert, relative to the
+    AM1.5G spectrum DEFAULT_CELL_EFFICIENCY is rated against. Built once per
+    run as an (altitude x zenith) grid and interpolated -- SPECTRL2 per sample
+    would be one spectrum per log row instead of ~400. See spectral_mismatch.py
+    for the derivation and the two anchors it validates against first.
+
+    Stacked with the encapsulation factors, not a replacement for them: see
+    the "Spectral mismatch" docstring section for why a flat laminate
+    transmission cancels out of M exactly.
+
+    Past sm.MAX_ZENITH_DEG (80 deg) Bird's model is not trusted, so M is HELD
+    at its 80 deg value rather than extrapolated, and the sample is flagged in
+    spectral_mismatch_clamped so the hold is visible downstream. Holding beats
+    NaN here: those samples carry almost no power, and a NaN would propagate
+    into every estimated-power column and punch gaps in the plots.
+    """
+    eqe_path = Path(eqe_path)
+    if not eqe_path.is_file():
+        raise SystemExit(f"Spectral mismatch needs the Max7 EQE table, but "
+                         f"{eqe_path} is missing. It ships next to this "
+                         f"script -- pass --eqe if it lives elsewhere.")
+    sr_wl, sr = sm.load_spectral_response(eqe_path)
+    u_ref, _ = sm.reference_usable_fraction(sr_wl, sr, 300.0, 4000.0)
+    # build_mismatch_grid also returns the broadband bias r; deliberately not
+    # used here (see spectral_mismatch.py) -- this script corrects the SPECTRUM
+    # only, and leaves its own Beer-Lambert irradiance model alone.
+    alt_grid, zen_grid, m_grid, _r = sm.build_mismatch_grid(sr_wl, sr, u_ref, dayofyear)
+    zenith_deg = 90.0 - np.asarray(sun_elevation_deg, dtype=float)
+    # interp_mismatch clips to the grid bounds, which IS the hold at 80 deg.
+    m = sm.interp_mismatch(alt_grid, zen_grid, m_grid, alt_m, zenith_deg)
+    return m, zenith_deg > sm.MAX_ZENITH_DEG
+
 
 # ---- Cell electrical parameters for the string-1 cell-temperature estimator
 # (estimate_string1_cell_temperature()) ----
@@ -1391,6 +1457,26 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
         merged["poa_string1_w_m2"] = merged["dni_w_m2"] * cos_aoi_string1
         merged["poa_w_m2"] = merged["poa_string1_w_m2"]
 
+    # Spectral mismatch M -- always applied, stacked on top of the
+    # encapsulation factors (see the "Spectral mismatch" docstring section for
+    # why stacking is right and what M does and does not already contain).
+    # Built once per run from the flight's own day of year.
+    print("Computing spectral mismatch M (SPECTRL2 grid, measured Max7 EQE) ...")
+    m_spectral, m_clamped = compute_spectral_mismatch(
+        merged["alt_msl_m"].values,
+        merged["sun_elevation_deg"].values,
+        int(merged.index[0].dayofyear),
+        args.eqe,
+    )
+    merged["spectral_mismatch_m"] = m_spectral
+    merged["spectral_mismatch_clamped"] = m_clamped
+    _lit = merged.loc[merged["sun_elevation_deg"] > 0, "spectral_mismatch_m"]
+    if len(_lit):
+        print(f"  M over sunlit samples: {_lit.min():.4f}-{_lit.max():.4f} "
+              f"(median {_lit.median():.4f});  "
+              f"{int(m_clamped.sum())} of {len(merged)} samples held at the "
+              f"{sm.MAX_ZENITH_DEG:.0f} deg zenith limit")
+
     # Optional temperature derating: factor = 1 + coeff%/degC * (Tout - STC_TEMP_C).
     # coeff is negative, so Tout ABOVE STC_TEMP_C (25 degC) is a LOSS
     # (factor < 1) but Tout BELOW STC_TEMP_C is a GAIN (factor > 1) -- this
@@ -1413,7 +1499,9 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
     # Estimated array output, three tiers (see module docstring for the
     # full breakdown): bare-cell ceiling -> encapsulation loss (ETFE cover x
     # POE encapsulant, both always applied, stacked -- see "Encapsulation
-    # transmission") -> optional temp derate. Bare is kept around
+    # transmission") x spectral mismatch M (also always applied, and a
+    # SEPARATE loss from the laminate -- see "Spectral mismatch")
+    # -> optional temp derate. Bare is kept around
     # unconditionally as a reference curve; the encapsulated "nominal" is
     # only kept as its own column when temp derating is on, so the plot can
     # show all three and make the derate's effect visible on top of the
@@ -1423,7 +1511,7 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
     bare_w = merged["poa_w_m2"] * total_area_m2 * args.cell_efficiency
     merged["pv_power_estimated_bare_w"] = bare_w
     encapsulation_transmission = args.etfe_transmission * args.poe_transmission
-    nominal_w = bare_w * encapsulation_transmission
+    nominal_w = bare_w * encapsulation_transmission * merged["spectral_mismatch_m"]
     if args.apply_temp_derate:
         merged["pv_power_estimated_nominal_w"] = nominal_w
         merged["pv_power_estimated_w"] = nominal_w * merged["temp_derate_factor"]
@@ -1439,15 +1527,16 @@ def analyze(args: argparse.Namespace) -> pd.DataFrame:
     # Same three-tier estimate, restricted to MPPT string 1 alone: its own
     # POA (PANEL_NORMAL_BODY_STRING_1) and its own cell count
     # (--string1-cell-count -- NOT half of --cell-count; the two strings
-    # aren't equal size). Encapsulation and temp-derate factors are reused
-    # as-is since the ETFE/POE cover and Tout apply array-wide, not per
-    # string. Only computed if this log actually has a string-1 channel;
+    # aren't equal size). Encapsulation, spectral-mismatch and temp-derate
+    # factors are reused as-is since the ETFE/POE cover, the incident spectrum
+    # and Tout all apply array-wide, not per string. Only computed if this log actually has a string-1 channel;
     # feeds make_string1_plot() only, not the array-wide summary above.
     if "pv_power_w_1" in merged.columns:
         area_string1_m2 = args.string1_cell_count * args.cell_area_cm2 / 1e4
         bare_string1_w = merged["poa_string1_w_m2"] * area_string1_m2 * args.cell_efficiency
         merged["pv_power_estimated_bare_string1_w"] = bare_string1_w
-        nominal_string1_w = bare_string1_w * encapsulation_transmission
+        nominal_string1_w = (bare_string1_w * encapsulation_transmission
+                             * merged["spectral_mismatch_m"])
         if args.apply_temp_derate:
             merged["pv_power_estimated_nominal_string1_w"] = nominal_string1_w
             merged["pv_power_estimated_string1_w"] = nominal_string1_w * merged["temp_derate_factor"]
@@ -1502,6 +1591,16 @@ def print_summary(df: pd.DataFrame, args: argparse.Namespace, tz: str) -> None:
     print(f"Encapsulation transmission: ETFE {args.etfe_transmission * 100:.1f}% x POE "
           f"{args.poe_transmission * 100:.1f}% = {args.etfe_transmission * args.poe_transmission * 100:.1f}%  "
           f"(always applied -- see docstring)")
+    if "spectral_mismatch_m" in df.columns:
+        lit = df.loc[df["sun_elevation_deg"] > 0, "spectral_mismatch_m"]
+        held = int(df["spectral_mismatch_clamped"].sum())
+        print(f"Spectral mismatch M      : {lit.min():.4f}-{lit.max():.4f}, median "
+              f"{lit.median():.4f}  (always applied, STACKS with encapsulation "
+              f"above -- see docstring)")
+        if held:
+            print(f"{'':27s}{held} sample(s) held at the "
+                  f"{sm.MAX_ZENITH_DEG:.0f} deg zenith limit (SPECTRL2 untrusted "
+                  f"past it; see spectral_mismatch_clamped)")
     print(f"STC-rated array power    : {rated_stc_w:.1f} W  (at 1000 W/m^2, 25 degC, bare cells)")
     print(f"Peak measured PV power   : {df['pv_power_actual_w'].max():.1f} W")
     print(f"Peak modeled GHI (flat)  : {df['ghi_w_m2'].max():.1f} W/m^2")
@@ -1832,8 +1931,8 @@ def make_string1_cell_temp_plot(df: pd.DataFrame, result: dict, out_path: Path,
          noise divided by a ~1.6 mV/degC-per-cell slope is a few degC of
          sample-to-sample chatter that the mean sees through.
       2. Cell-plane irradiance implied by measured current vs modeled
-         clear-sky POA x encapsulation. Gaps between them are clouds (or
-         POA-model error) -- this is the leg that makes the estimator
+         clear-sky POA x encapsulation x spectral mismatch M. Gaps between
+         them are clouds (or POA-model error) -- this is the leg that makes the estimator
          immune to clouds, made visible.
       3. Cell temp minus fuselage TC. Expected NONZERO and growing with
          irradiance: the TC sits on the side of the fuselage in its own
@@ -1876,9 +1975,14 @@ def make_string1_cell_temp_plot(df: pd.DataFrame, result: dict, out_path: Path,
     legend_outside(ax, ax2)
 
     ax = axes[1]
+    # M belongs here: the green trace is what the CELL converted, so the red
+    # trace it is compared against has to be spectrally corrected too, or the
+    # gap between them reads as cloud when it is really spectrum. This is the
+    # same convention am_calibration.py uses.
     encapsulation = args.etfe_transmission * args.poe_transmission
-    ax.plot(df.index, df["poa_string1_w_m2"] * encapsulation, color="tab:red", alpha=0.6,
-            label="Modeled Clear-Sky POA x Encapsulation")
+    ax.plot(df.index, df["poa_string1_w_m2"] * encapsulation * df["spectral_mismatch_m"],
+            color="tab:red", alpha=0.6,
+            label="Modeled Clear-Sky POA x Encapsulation x M")
     ax.plot(df.index, df["g_cell_string1_w_m2"], color="tab:green", linewidth=0.8,
             label="Cell-Plane Irradiance Implied by Measured Current")
     ax.set_ylabel("Irradiance (W/m^2)")
@@ -2027,6 +2131,7 @@ def compute_pct_diff_at_angle(window: pd.DataFrame, args, theta_deg: float) -> p
     normal_body = _panel_normal_body(x_cad=-np.cos(theta), z_cad=np.sin(theta))
     cos_aoi = cos_incidence_angle(roll, pitch, yaw, elevation, azimuth, normal_body=normal_body)
     estimated_w = dni * cos_aoi * area_string1_m2 * args.cell_efficiency * encapsulation_transmission
+    estimated_w = estimated_w * window["spectral_mismatch_m"].values
     estimated_w = estimated_w * temp_derate_factor
     estimated_w = pd.Series(estimated_w, index=window.index)
 
@@ -2214,6 +2319,11 @@ def main() -> None:
                          help="Fractional light transmission through the POE encapsulant "
                               "(stacks with --etfe-transmission -- see docstring). Flat figure, "
                               f"not spectrally-weighted. Always applied. Default {DEFAULT_POE_TRANSMISSION:.2f}.")
+    parser.add_argument("--eqe", default=str(DEFAULT_EQE_CSV),
+                         help="Measured Max7 external-QE table driving the spectral "
+                              "mismatch factor M (always applied -- see docstring). "
+                              "Bare cell, not laminated. Default: max7_eqe.csv next "
+                              "to this script.")
     parser.add_argument("--cell-vmpp-stc", type=float, default=CELL_VMPP_STC_V,
                          help="Per-cell Vmpp at STC [V], the anchor for the string-1 "
                               "cell-temperature estimate. THE dominant systematic there "
@@ -2281,6 +2391,7 @@ def main() -> None:
     export_cols = [
         "lat", "lon", "alt_msl_m", "flight_phase", "sun_elevation_deg", "sun_azimuth_deg",
         "ghi_w_m2", "dni_w_m2", "dhi_w_m2", "poa_w_m2", "poa_string0_w_m2", "poa_string1_w_m2",
+        "spectral_mismatch_m", "spectral_mismatch_clamped",
         *(["roll_deg", "pitch_deg", "yaw_deg"] if "roll_deg" in df.columns else []),
         *(["tout_c"] if "tout_c" in df.columns else []),
         *[c for c in df.columns if c.startswith("pv_")],
